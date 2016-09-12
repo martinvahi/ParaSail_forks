@@ -1,0 +1,4 @@
+Tree is (2, Left => (1, Leaf(0), Leaf(1)), Right => (3, Leaf(1), Leaf(3))
+Has some positive counts = #true
+Has some negative counts = #false
+Sum of squares = 25

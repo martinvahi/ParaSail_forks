@@ -1,0 +1,13 @@
+Pushing 1..5
+Pop = 5
+Pop = 4
+Pushing 6
+Pop = 6
+Pop = 3
+Pop = 2
+Pop = 1
+stack_simp2.psl:52:34: Error: Assertion failed:  {> *Stack_Underflow_Check* Count(S) > 0 <}
+stack_simp2.psl:54:19: Error: Index must be in 1 ..  5, value =  0
+stack_simp2.psl:54:19: Error: Exception SYSTEM.ASSERTIONS.ASSERT_FAILURE raised.
+stack_simp2.psl:81:28: Error: Exception SYSTEM.ASSERTIONS.ASSERT_FAILURE raised.
+stack_simp2.psl:60:1: Error: SYSTEM.ASSERTIONS.ASSERT_FAILURE raised in execution:

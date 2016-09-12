@@ -1,0 +1,125 @@
+Using ParaSail/Sparkel as a modeling language.
+
+---  March 2014  ---
+
+We should think of a model as being represented as something like XML,
+on disk.  We probably don't want a model to be an "active" object.
+We could have references to user-defined functionality, but the model
+should not "contain" that functionality.  We separately will have to
+define the extra classes, etc., which will implement special blocks.
+The references probably want to be unique strings, perhaps using the
+XML "namespace" notion to provide some hierarchical naming, though
+the names could presumably have "."s, "-"s, or equivalent in them.
+
+---  December 2013  ---
+
+The Simulink S-Function represents a primitive "block" in a Simulink model.
+
+Each S-Function is in charge of a vector "x" of internal state,
+by defining the derivative (continuous) or the next-sample-time value
+(discrete)for each element of x.  It is also in charge of providing
+outputs y.  It has some number of inputs "u".  The outputs "y" are
+defined in terms of the x internal-state vector and the u input vector.
+
+S-functions can detect "zero crossings" (is that when some value
+of x goes from one side of zero to another, or when the derivative
+crosses zero?)
+
+Simulink C S-functions have the following operations:
+  * MdlInitializeSizes  -- Initialize the sizes portion of the simulation
+                           structure using ssSet macros.
+  * MdlInitializeSampleTimes -- Initialize the sample times and offsets.
+  * MdlOutputs          -- Compute outputs
+  * MdlTerminate        -- Perform any necessary end-of-simulation tasks.
+ Optional operations:
+  * mdlSetInputPortWidth -- Use to override dfault scalar expansion rules
+                           for inherited port widths
+  * mdlSetOutputPortWidth -- Use to override default scalar expansion rules
+                           for inherited port widths
+  * mdlSetInputPortSampleTime  -- Override inherited sample times
+  * mdlSetOutputPortSampleTime -- Override inherited sample times
+  * mdlSetWorkWidths    -- Use if work-vector widths are func of port widths
+  * mdlInitializeConditions -- Set initial value of contin and discrete parts
+                           of state vector.  Function needed if any states;
+                           called again if block in reinitialized subsystem.
+  * mdlStart            -- Perform one-time initialization, typically of
+                           work vectors.
+  * mdlCheckParameters  -- Check block parameters; should be called at start;
+                           Simulink calls any time parameters change.
+  * mdlProcessParameters -- Called by Simulink after mdlCheckParameters;
+                           should also be called from mdlStart.
+  * mdlGetTimeOfNextVarHit -- Compute time of next sample
+  * mdlUpdate           -- Update values of discrete components of state;
+                           will be called once for each sample hit; if there
+                           are multiple sample times, must include logic
+                           to decide which components to update.
+  * mdlDerivatives      -- Set values of derivatives of contin components.
+
+ mdlInitializeSizes expects the following sizes to be specified:
+   NumContStates, NumDiscStates, NumOutputs, NumInputs, DirectFeedThrough,
+   NumSampleTimes, NumInputArgs, NumIWork, NumRWork, NumPWork, Options
+   [NOTE: NumIWork, NumRWork, and NumPWork determine persistent "work"
+    vector sizes]
+
+ mdlInitializeSampleTimes expects calls on ssSetSampleTime (S, n, T)
+   one for each NumSampleTimes, with n going 0 .. NST-1; may also
+   call ssSetOffsetTimes (S, n, Offset)
+
+ State variables, block inputs and outputs
+
+Signals should have units, precision, scale factors, matrix dimensions, ...
+
+Operations include initialization, derivative calculation, next-step value,
+etc.
+
+abstract interface Sim_Signal<> is
+    //  This type is used to hold a value
+    //  which represents a conceptual "signal."
+
+    //  NOTE: We aren't worrying about signals that are themselves vectors
+    //  at this point, though they could be handled using the #special kind.
+
+    type Unit_Enum is Enum<[#distance, #mass, #duration, #temperature, ...]>
+    type Units_Vector is Array<Univ_Real, Indexed_By => Units>
+
+    type Signal_Kind is Enum<[#int, #real, #bool, #special]>
+
+    func To_String (Sig : Sim_Signal) -> Univ_String
+    func From_String (Str : Univ_String) -> Sim_Signal
+
+    func Kind (Sig : Sim_Signal) -> Signal_Kind
+    func Units (Sig : Sim_Signal) -> Units_Vector
+    func Scale (Sig : Sim_Signal) -> Univ_Real
+
+    func Value_As_Real (Sig : Sim_Signal) -> optional Univ_Real
+    func Value_As_String (Sig : Sim_Signal) -> Univ_String
+
+    func Set_Value_As_Real (var Sig : Sim_Signal; Str : Univ_Real)
+    func Set_Value_As_String (var Sig : Sim_Signal; Str : Univ_String)
+
+end interface Sim_Signal
+
+abstract interface Sim_Block<> is
+    type Real_Vector is Vector<Univ_Real>     // Used for continuous signals
+    type Signal_Vector is Vector<Sim_Signal+> // Used for other signals
+
+    //  These determine number and kinds of signals
+    func Num_Inputs (Sim_Block) -> Univ_Integer
+    func Num_Outputs (Sim_Block) -> Univ_Integer
+    func Num_Discrete (Sim_Block) -> Univ_Integer
+    func Num_Continuous (Sim_Block) -> Univ_Integer
+
+    func Continuous_Units (Sim_Block) -> Vector<Sim_Signal::Units_Vector>
+      //  This provides a units vector for each continuous signal
+
+    func Next_Discrete (Sim_Block; Inputs : Signal_Vector;
+      Continuous : Real_Vector; Discrete : Signal_Vector) -> Signal_Vector
+      //  This computes the next value for each discrete internal signal
+
+    func Derivative (Sim_Block; Inputs : Signal_Vector;
+      Continuous : Real_Vector; Discrete : Signal_Vector) -> Real_Vector
+      //  This computes the derivative for each continuous internal signal
+
+    func Display_Block (Sim_Block; var Canvas+)
+      //  Display block on the given canvas
+end interface Sim_Block

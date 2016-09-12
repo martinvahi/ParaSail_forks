@@ -1,0 +1,591 @@
+Thoughts on improving the LLVM generation.  15 May 2015
+
+Basic idea is to turn all local area and parameter area references into
+LLVM register references.
+
+Some locals are subject to up-level references, so those need to be
+stored in memory across calls that reference them.  But they probably
+want their own cell, so there is no aliasing associated with them.
+
+One simple approach would be to make every local into a separate
+variable.  One problem is the stack space left for task control blocks,
+including the associated trailing parameter list.
+
+Some local space is used for passing parameters.  These should ideally be
+allocated separately, with an appropriate struct type.  If they are
+connected to a task control block, that should come first in the struct.
+
+------
+
+Initial approach is simply to do all of the loads/stores that might
+reference the local area or the parameter area in the Load_Via_Locator
+and Store_Via_Locator routines, presuming we can establish a cache that
+will keep track of what locals/parameters are in what registers.
+We could add a parameter to Get_Locator_Ptr to know how much of the
+cache to kill/invalidate/flush.  We also need to flush at certain basic
+block boundaries, until we get the "phi" mechanism working.
+
+Load_Via_Locator should simply copy the register in the cache associated with
+the given address, or initialize the cache so that multiple loads
+of the same parameter or local refer to the same register.
+Store_Via_Locator should update the cache with the value
+being stored (which might be a literal rather than a string starting with '%').
+to specify the number of words to "kill/flush" at the given address.
+At basic block boundaries we need to detect whether the cache is consistent,
+and the register definition dominates the reference.
+By iterating we can determine what is unmodified in the loop, or we could
+pre-analyze.
+
+---
+
+Interface to Stack_Cache:
+
+- Construct a cache (one per invocation of Call_Operation)
+- Flush the cache (e.g. when starting a nested block)
+- Fetch contents of Cache(stack-locator) -> llvm-reg  (for Load_Via_Locator)
+- Set contents of Cache(stack-locator, llvm-reg) (for Load/Store_Via_Locator)
+- Flush part of cache(stack-locator, num-words) (for Get_Locator_Ptr)
+- Save state of cache
+- Restore state of cache from saved value (destructively?)
+- Merge in saved state of cache (destructively?)
+
+Currently, labels are added by calling "Add_Label" and are physically inserted
+into instruction stream at the very end.  We would like to know when we start
+a new basic block, and merge/flush/... as appropriate.  Next_PSIR_Instr could
+probably indicate that, or we could have an LLVM query.  We would also
+want to know the predecessors.  It might be nice to have queries that would
+be compatible with using a "full" CFG package at some point.
+
+-----
+
+Alternative approach, VN-based IL:
+
+Perhaps construct a completely separate IL, based around value numbers
+computed by ParaScope.  
+- "Store" operations would be invoked when storing
+into components of large objects, and through references, and into
+objects that must support up-level references.
+- "Call" operations would be used for invoking a call.  
+- "Load" operations would be used when loading from components
+of large objects.  
+- An implicit "load" would be used the first time
+we encounter an "unknown" or "input" VN (we will need to know what a nested
+block/operation might update, including when we pass a nested operation as
+a parameter).
+- A "phi" operation will be explicitly provided for merging values
+at join points
+- A few other operations will be needed, particularly having to do with
+parallel blocks/calls.
+
+There will also be control-flow-graph (CFG) information, so will know
+where to put labels, etc.
+
+If the compiler is given a VN-based IL, it will use that instead of looking
+directly at the PSVM instructions.  The VN-based IL might be represented
+as a parallel array of IL sequences, indexed by same (PSVM) code offset as the
+PSVM IL, with each sequence being zero or more VN-IL instructions.
+
+----------
+
+We should identify for every PSVM op, what would be the possible VN-IL ops.
+It might be appropriate to do an extended example, to suggest what would be
+the VN-IL for some existing code.  We might start with the scope_test.psl
+example.
+
+-----------------
+
+It might be worth going back to a halfway approach, where the VN-IL augments
+the PSVM.  What we are trying to reduce are the stores and loads from
+the stack, as well as the redundant loads from anywhere.  We also want to
+use separate "alloca"s for calls, and TCBs + param-list, if possible.
+If we know what stack locations are:
+1) purely temps -- can replace with LLVM registers
+2) associated with a call -- can replace with separate alloca's
+3) up-level referenced -- need to be stored, but not redundantly loaded
+that should significantly improve the code.
+
+Other improvements would be associated with fetching type descriptors,
+strings, constants, etc.  These are read-only, and so eliminating redundant
+loads should be relatively easy.
+
+Currently most loads are handled with Load_Via_Locator.  But there are still
+some that provide levels of indirection.  Perhaps that should be
+an additional indirection count to "load via locator."
+Similar considerations apply to store via locator, but we need to be sure
+not to pessimize the code by a load indirect followed by a store indirect.
+We could add a load indirect/store indirect operation, and have
+Load-via-locator take an indicator that it is loading a pointer/ref rather
+than a value.
+
+Select_[Poly_]Ancestor uses some loads that could be unified.
+
+----
+
+It would be nice to have a situation where ParaScope was providing "hints" 
+that could be ignored, and that the Compiler could properly decide whether 
+it could believe a hint by checking its own tables.  For example, ParaScope
+might say the value of interest is in VNxx, and the Compiler could check
+VNxx already exists in an LLVM register that was defined in some dominating
+block.  We could steadily improve the hints, and honor more of them.
+
+
+---
+
+From each locator we get an address VN.  For local areas/enclosing locals,
+param areas/enclosing params, we get a simple Param_Addr or Local_Addr,
+with level/bb-id.  For indirect references, the base address might be
+a local or a parameter.
+
+Load_Via_Locator looks up value of locator at given instruction.
+We need to know the value of a locator within certain ranges of
+instructions.
+
+Store_Via_Locator determines what value number to give to value, or to
+do an actual store.
+Load_Via_Locator determines what value number to fetch fron.
+Store_Indir determines whether to create a new value number or
+do an actual store.
+What question do we ask of the VN_IL do decide these things?
+We have a locator and a level of indirection.  We have a LLVM name
+for the content as well as the address, which we then use to store back into
+with Store_Indir.
+
+We need to know whether the value is live at the end of the block, if that
+is a join point.  If so, we need to store into memory, or use a "phi" at
+the successor.  We can allocate a separate object, but
+we need to remember the name so we can load from it in the successor, but
+we would have to remember to use the same memory cell in other predecessors
+of the successor, which seems to be simply making the job harder.
+Alternatively we do things backwards, that is, start at the end of the
+routine and work forward.
+
+Alternatively, we use the same memory cell for all stores into the
+same location if it is live across join points.  We need to know whether
+it is referenced at calls to nested operations/blocks, in which case we
+need to store it in the stack frame.  But we don't need to ever store
+outgoing parameters into the main stack frame, nor pass the address
+of the stack frame to anything but nested procedures.
+
+When we come to a call, we need to put all of the values into memory.
+
+Back to the questions --
+
+Load_Via_Locator -- Value number to put into Content VN and Address VN.
+Would code origin help?  Not really, since most loads are not generating
+a new OID.  We should focus on locators (or address VNs).
+
+Get_Locator_Ptr needs to remember locator associated with llvm name,
+so Store_Via_Locator can use that information.
+
+In general we need to keep a mapping of llvm name to what it holds.
+It could be a locator.  It could be a fetch via a locator.
+It could be multiple levels of fetch.  These llvm names only last
+a single instruction, so this mapping can be very small, because
+all values are back in memory (i.e. locator) by the end of an llvm
+instruction.
+
+We *almost* never actually load or store from memory.  Instead we load
+or store from value numbers.  So before a load we check to see if there
+is a VN we should load from, for each level of indirection.  
+Before a store we check to see if there
+is a VN we should store into.  Only memory or VNs cross instructions.
+When we store an llvm-reg into memory, we need to know the something about
+it.  It is the output of Get_Locator_Ptr, or some number of indirections
+thereof.  This is most important for a Store_Indir, since normally ParaScope
+should track other info itself.
+
+So the question is:
+
+    Store_Via_Locator -- Here is locator, and indir count, and value being
+      stored.  Do we copy into a VN?  Do we store into memory at existing
+      llvm reg?
+      NOTE: we never store into a different location (see Call explanation),
+        but instead always use VNs to communicate, letting individual
+        instructions store and fetch from temporary memory if necessary.
+    Call -- Need set of VNs to initialize param list, and VN(s) to initialize
+            from output(s).  This implies that VNs are required for call
+            parameters.  If not provided, fall back to normal call.
+            This implies stores into (outgoing) param list and fetches
+            from result slot(s) of outgoing param list are all performed
+            by the "call" (or parallel) instruction.
+    Create_TCB_obj -- Master actually resides in memory, but TCB pointer
+            need not reside in frame, but can be in its own location.
+            We can allocate a temp and then load it into a VN.
+    Load_Via_Locator -- Here is locator and indir count and llvm_reg to
+      initialize.  Do we copy from a VN?  Do we load from memory at
+      existing location?
+
+Compiler could compress stack frame by noticing what is referenced up-level
+and placing it at the beginning of the frame.  Or it could simply allocate
+TCB objects and outgoing calls always at a place separate from the named
+local variables.  It might simplify other things if we never tried to
+compute directly into named variables, but only used compute-into-target-slot
+for anonymous intermediate results of calls.
+
+-------- 16 June 2015 ------  Locator-to-VN map
+
+Instr#7 in scope_test.psl is the following:
+    4 (COPY_WORD_OP, Destination => (Local_Area, 7), Source => (Base_Registers'First + 7, 1))
+This uses local area 7 but then clobbers it.  What VN do we associate
+with local_area 7?  Do we use the value at the end of instr#6?  That
+seems like the right answer, if we presume that updates happen at the
+very end.  Calls are more complicated, perhaps.
+
+%vn_1 is used for *all* nulls, but that doesn't work because each null
+%can be different.  Probably need a flag in ParaScope to create new VNs
+%for each null, but know that it is in fact a null value -- it can still be a null literal, but just make it unique for each origin.
+
+More generally, we can't define the same VN twice, so we need to check
+whether a given VN has already been initialized.  One idea was to return
+0 to indicate desired VN already has appropriate value.  Note that in a
+copyword operation, it is highly likely that the vn is already defined.
+Might want to check at beginning of operation.  If already defined, then
+suppress entire instruction rather than just suppressing final store.
+
+Calls aren't doing the right thing yet.  Need to alloca a parameter
+list, fetch VNx for each param_start+N, and store into alloca'ed area.
+Afterward, need to copy alloca'ed zeroth slot back into param_start+0.
+For by-reference parameters, if they currently live in an llvm register,
+need to alloca a slot for them, copy local+N into alloca'ed temp, and
+store alloca'ed temp's address into call-alloca'ed-area.
+
+Need to understand what is happening with composite objects and components,
+and be sure it is consistent.
+
+----------
+
+We need to handle by-ref parameters, and in particular assign_word, which
+is expecting the address of the destination, which might be in the local
+area.  For local-area objects, we could create temps, and copy into
+them before hand, and copy back from them afterword.
+
+[This might be another argument for eliminating pass by reference, and go to
+full copy-in/copy-out.  But this poses difficulties when the reference
+is the result of a call on an operation, such as indexing.  We clearly need
+to call the indexing operation only once.  Packed indexing poses its own
+set of problems.]
+
+We need to handle up-level references.  For these, we should probably just
+store "through" to the local area slots that are referenced up level.  At
+some point it would be nice to "compress" the stack.  At a minimum we could
+keep track of the highest local offset that is up-level referenced.
+
+ParaScope would need to keep track of the highest local offset that
+is up-level referenced, as well as all of the slots that are up-level ref'ed,
+for each nested block and for the operation as a whole.  Nested operations
+need to figure into this as well, though those are currently handled
+pretty independently.
+
+-------
+
+We can perhaps use the "Object_Access" abstraction to represent the up-level
+references by a nested operation.  It would be nice to remove internal
+references and only store references involving up-levels.  How do we
+decide the level of a sym?  Note that we are in the pre-CG phase, so we
+don't have a level filled out.  However, we do have a sym, which has an
+enclosing region, so that might be adequate.  If we ignore those enclosed
+within the operation (including parameters), that would seem to be adequate.
+
+
+-----
+
+To deal with recursion, we can keep track of number of uplevels at point of
+call, and if that is less than the number when we finish doing Pre_CG on the
+operation, then we need to do it again, or do the encloser again if the
+calls occurred before we started doing Pre_CG on the operation.
+
+How do we signal that the encloser needs to be analyzed again?  Could we
+set a flag in the visitor, or in the Read_Write mapping?  The visitor isn't
+passed up, so that won't work.  The Read_Write mapping is combined, so
+that provides an opportunity to propagate.  Alternatively, we add a flag
+to the Op_Sem, which is set to true when we need to re-run the Pre_CG
+analysis.
+
+At a call site, we want to incorporate the effects of uplevel references.
+Currently we combine the effects of evaluating each operand using How_Combined
+being "Parallel" and Mode being "Param_Computation."  This is independent
+of the actual parameter mode for the call.  For globals, we want to be sure
+that we don't violate various rules:
+  1) If global is updated, then it must not be aliased with any parameter.
+  2) If global is read, then it must not be aliased with any "var" param.
+  3) Effects on global should be included in effects at point of call.
+
+-----
+
+Need to suppress multiple identical error messages generated in Pre_CG
+when we have to iterate.  Simplest would be to have a global set of
+messages already issued.  We could hash the entire string, or we could
+break it down into its parts.
+
+-----
+
+We now have a correctly initialized Uplevel_Refs Read_Write_Mapping in the
+Operation_Semantic_Info for nested operations.  It is also on the Spec_Sem
+if there is a separate one.  Unfortunately, neither of these is available
+at a call site.  All we have is a target "routine," and there isn't really
+any way to get from a routine to the associated operation_sem info.
+So this implies we will need to put something on the PSVM Routine object.
+What sort of object info/identifier should we use?  The locator is one thing,
+and perhaps the type, of the uplevel object.  One issue is the order in
+which we generate code.  But that shouldn't really matter since the llvm
+generator runs after all code has been generated.
+
+We also have to worry about uplevel references from nested blocks.  We don't
+know about these until we generate code for the block.  From the LLVM code
+generator, nested blocks and nested operations are pretty much equivalent.
+But from the Code_Gen phase, they are quite different.  We need to decide
+what we want in the PSVM to represent up-level references, both for nested
+operations and nested blocks.  Probably we will record something on the
+nested operation/block header, recording the up-level references.  We
+want nested blocks to include the up-level refereneces from their nested
+operations.  But note that some of the up-level references from an operation
+nested in a nested block might be to locals of the nested block, and others
+might be to the enclosing operation, or some intervening nested block, etc.
+The level number should give the story.
+
+------
+
+Focusing on how we will use the up-level information, let us presume it is
+some kind of table indexed by locator, including both locals and parameters.
+We might try to allocate non-up-level-referenced locals at higher offsets,
+or even use completely different locators for outgoing parameter lists.
+It would also be nice to know all of the locators that are up-level
+referenced in general when compiling a routine, so we could use a simple
+"store-through" approach for such locators.  One issue is that we might
+have two unrelated variables stored at the same locator, and end up storing
+through with both of them, even though only one of them needs it.  In Java
+variables have a range of byte-codes where they are meaningful.  We could
+record that in the object_sem info, presumably.
+
+Conceivably we could have a single table, containing objects defined or
+referenced, indexed by locator (or perhaps level/param vs. local/offset),
+with name, type, first use and last use, read vs. R/W.  But it is probably
+unwise to mix optional with essential information.   So let's stick to
+up-level references.
+
+So where do we use this information?  In ParaScope, on a call on a nested
+operation, we need to create new value numbers for objects that are modified.
+In the compiler, we need to be sure that objects that are read are in the
+right stack slot before we make the call.  So the compiler needs to keep track
+of when it suppresses a store into a local stack slot, and flush out those
+that are of interest at a particular call, including a nested block "call."
+We are storing up-levels and parameters as they are modified.  We are only
+interested in "reads" of the local stack.  We don't care about reads that
+are of enclosing stacks, as those are already being kept in memory.
+
+Now what about branching?  We have ignored the "phi" nodes so far.  That
+works for the "read" side because the VN won't be in the init'ed set.  But
+we will have similar problems if we suppress a store and then go to a join
+point.  Essentially a join point is similar to call, unless we emit
+appropriate phi nodes.
+
+---  phi nodes
+
+So, what is needed to issue appropriate "phi" nodes?  At each join point we
+need to know which phi VNs need defining, and what are their inputs.
+Alternatively, we just force into memory at joins.  Joins can be identified
+by the instruction index, but we also need to know about the end of the
+predecessor basic blocks.  That is also recognizable, by being equal to
+Op_Ctx.CFG[Op_Ctx.Cur_Node_Id].Last.  If compiler keeps track of what VNs
+are *not* in their "home" location, it can iterate over those and check
+whether they need to be flushed.  So VN_IL needs to answer the query of whether
+a given VN is an input to a phi at the join point.  More generally, at the
+end of an instruction, compiler could ask VN_IL which vns need to be stored, of
+those not currently in their "home" base.  If the next instruction is
+a call_op, that would handle the up-level problems.
+
+Do we need to set Inited_VNs to [] at join points?  Perhaps compiler should
+also check with VN_IL to determine which Inited_VNs need to be forgotten.  
+But that is a harder question, because the compiler might have loaded
+the VN on one branch but not on the other.  We probably need to keep track
+of the instruction where we init a VN, so we can find out whether it dominates
+the current point of use.  We don't really need to clean out Inited_VNs
+if we don't want to, so long as we keep track of the set of places where
+the VN is inited.  There will only be more than one if they don't dominate
+each other.
+
+---------
+
+In VN_IL, we now have a mapping from locator to VN called
+Local_Values_Held_In_VNs, plus a couple of routines Might_Need_To_Flush_VNs
+and Need_To_Flush_VN which indicate whether any VNs need to be flushed, and
+exactly which ones need flushing.  At a call site, we need to flush
+items that are up-level referenced, or whose address is passed as a parameter.
+If we have longer-lived ref objects, we may need to flush such objects
+more frequently, e.g. before an indirect load or a call that takes the ref.
+We also have to be sure that all these indirect effects are properly handled
+in ParaScope, so new value-numbers are generated to represent side effects.
+
+----
+
+LLVM registers can only be initialized in one place, so if the same VN
+is used in two places that don't dominate one another, we need
+to a) hoist the definition to a common dominator, or b) combine multiple
+definitions of the same VN using a phi, or c) just reload the VN next time
+it is needed.  In (b) and (c) we need to add a unique suffix to the LLVM
+register name.  (c) is clearly the simpler.
+This implies changing Inited_VNs to be a map, indicating the instruction or
+basic block where the VN was init'ed.  If the place where the VN was init'ed
+does not dominate the current instr, then we add the current instr-index
+to a vector of instr-indices, and add a suffix like "_2" to the LLVM
+register name.
+
+--------
+
+We need to keep track of the globals that are read as part of a call, or as
+part of a nested block execution.  It is relatively easy for code-gen to
+record the uplevel references to locals/parameters associated with a
+nested routine, or walk the Uplevel_Refs directly.  There is no Uplevel_Refs
+on nested blocks, so a different mechanism is needed there.  That could be
+done by ParaScope itself.
+
+If we want to walk the Uplevel_Refs, that is an array of hash tables, each
+a mapping from obj-id to access tree.  Object_Ids are stored in the
+Object_Id field of Object_Sem infos.  Object_Ids contains syms, which can
+get us back to sem_infos, where we can get the locator via the Info field,
+which points to an Object_Location_Info.  This in turn contains
+an Object_Locator and a level.  We could simplify these into object_locators
+by incorporating the level.  They would all be enclosing_param/enclosing_local
+locators.  We could add these locators to the Routine structure.  We would
+not need to use this information in the interpreter, so it does not need
+to be part of an imported/compiled routine.  We could think about putting
+some of this information on the Begin_Nested_Block_Op, but it would have
+to be filled in later, by incorporating further nested blocks, with appropriate
+level fixes.
+
+----
+
+When optimizing, we need to fix the Start/Add_Parallel* operations to
+store the parameters into the area following the TCB, and retrieve the result.
+Alternatively, we flush everthing.
+
+----
+
+When there is a call on a nested function from inside a loop, where the
+nested function updates some global initialized outside of the loop, but
+not otherwise referenced, we have a problem (this showed up in init_points.psl
+of kmeans_fast example, where X is read/updated by Use_Num function).  
+When we encounter the call on the nested procedure,
+we flush all of the VNs.  Unfortunately, some of those VNs hold out-of-date
+information.  We should either flush before we enter the loop (which would
+be more efficient unless we know we will never need to flush inside the
+loop), or we flush before and reload after the call on the nested func, but
+that is somewhat silly because we have no local use of the VN later.
+Ideally we flush before a loop if anywhere inside the loop there is a
+nested call that needs the value.  It would sure help to know whether a
+value is "live" at any given point.  
+
+Let's think about doing this "precisely."  We really don't want to flush the
+VN from outside the loop at a point inside the loop, both for efficiency,
+and for correctness.  We want to flush before entering a loop if:
+  a) the value is read as an up-level reference.
+  b) the read happens inside the loop (though if it happens after the loop,
+     no harm done).
+
+More generally we may want to flush immediately if the value is read by
+an up-level reference.  Then we can ignore calls on nested procedures.
+Store_Address is also relevant here.  If we flush just before a Store_Address
+we want to be sure we aren't flushing something that is out of date.
+Eventually, if something is referenced with a store_address, we want to
+put it in its own memory cell.  But in the near term, we could "write through"
+items that are referenced in a store address.  Ideally we would have an
+associated "initial" VN for a store address, and store through when that
+value number is stored into that location.
+
+Loops are important here.  If we keep track of what Locator/VN combinations are
+up-level read or used with a store-address, and we propagate that to each
+enclosing loop, then when we are about to enter such a loop, we can do
+a flush of any relevant VNs.
+
+-----------------  17-Aug-2015
+
+We are now bumping into a problem where there are two different VNs that
+both hold the content of the same locator, when they held unrelated values.
+One fix would be to use non-overlapping locators for all local variables
+and temps.  This could increase the size of the stack quite a bit, which
+at least currently still shows up in compiled code.  A second approach is
+to try to notice when a new value is stored into a locator that has an
+associated VN, and somehow mark the VN as de-inited.  That seems the
+simplest.  A third alternative is to keep track of "liveness" of VN/locator
+pairs, though that becomes a challenge even to define what we mean, much
+less maintain the data structures.
+
+------------ 18-Aug-2015
+
+Next problem: VN1 contains Locator1, then value of Locator1 changed in
+then/else parts, then need to flush Locator1, we end up storing VN1
+rather than the current value.  Do we need to look at the "phi" nodes
+to dominate the first load, or can we presume that any assignment can
+flush the prior value in the locator?
+
+-------------- 19-Aug-2015
+
+It may be time to bite the bullet and produce a good map of what "live"
+value (if any) is in every memory cell at any given instruction.  For
+each locator/value-number combination, it would be nice to know the
+set of instruction indices where that combination is "live."
+If we keep track of value numbers that hold the contents of a locator
+and might be the only copy, at a given instruction we want to know whether
+the value number is "live" in that locator.
+
+So how do we do this?  In ParaScope, we know when we associate a value number
+with the contents of a locator.  We have "fetch" associations and "store"
+associations.  The "store" associations are made with every locator that
+has its (address) value number computed in a given instruction.
+The "fetch" associations are only made when "Remember_Fetched_Value" is called.
+
+It seems like not much more work to produce a complete map of where locators
+are live, and what values they contain.
+
+-------------  20-Aug-2015
+
+We would use this data as follows vn_il.psl:
+
+We would still record when we keep a value in a VN and don't store it into
+memory.  At that point we should verify that the locator/VN combination
+matches our database.  If we already have a different VN in the locator,
+we should remember that old combo as well if there is a later instruction
+that has that VN in the locator.  If not, we can remove the old one.
+If the new locator/VN combo's lifetime ends immediately, then there is no
+need to remember it at all.
+
+When we get to the point of checking whether we should save the contents
+of a locator, we see whether any of the combos associated with the locator
+are still live at the current point.  We can delete those that are never
+live later than the current point.  If we save the value, we can delete
+the locator/VN combo if the current point dominates all later places where
+the locator/VN combo is live (which may be hard to check).  
+Alternatively, we leave it in the "flush" places and considered it 
+having been flushed if one of the flush places dominates
+the next point where we check that locator/VN combo.
+
+We don't really need to know when the locator/VN combo is added to the set
+of un-stored locator/VN combos, except to check whether it is live at some
+later point.
+
+So how do we build up this database of locator/VN live ranges?  The traditional
+way of doing liveness is to do local liveness (forward), building up a local
+kill set, and then doing a global propagation to build up the global
+live-out set.  If we do this after value numbering, then we should be able
+to include the value number at each point.  Each member of the local kill
+set could actually be a mapping from locator to VN.  Actually, by working
+backwards we can build this up.  We already have the fetched VNs mapping.
+If we also update the Store VNs mapping to only hold changes to the
+contents of a locator, then we have the info we need.
+
+------------  21-Aug-2015
+
+OK, we have updated Store_VNs to be augmented only when Value stored at
+locator actually changes.  That gives us the instruction where the
+Locator/VN becomes live.  By walking backward we know when it becomes
+live, because a Fetch causes it to be live.
+
+------------- 12-Sep-2015
+
+We decided to switch over to using address VNs from locators as indexes
+into the value stored in a given address at a given point.  However, that
+creates a problem with Locators that involve a level of indirection.
+More generally going back and forth between locators and addresses is a pain.
+In ParaScope we have a temporary mapping from locator to address.  Perhaps
+we should save that for use by VN_IL when needing to convert a locator to
+an address VN.

@@ -1,0 +1,909 @@
+import PSC::*, PSL::Short_Names::*
+
+//  Utility object for printing LLVM code
+//  Also keeps track of a lot of state information
+//  One printer per source file
+//  see llvm_printer.psi for more comments
+class PSC::LLVM_Printer<> is
+   const Verbose_Debug : Boolean := #false;
+   const Debug_Decls : Boolean := #false;
+
+   //  Temporary Vector of llvm code
+   //  The whole vector is one PSIR instruction
+   //    Each String is one llvm instruction
+   //  Added to buffer after a PSIR instr is finished compiling
+   var Buffer : ZVector<String> := [];
+
+   //  ZVector of lines of llvm code
+   //  One entry per PSIR insruction
+   var LLVM : ZVector<ZVector<String>> := [];
+
+   //  Current Indentation level of the llvm code
+   var Indent : String := "";
+
+   //  Set of labels
+   //  Because the set has no duplicates, won't get double labels
+   var Labels : Set<Int> := [];
+   
+   //  Set of Declarations
+   var Decls : Set<String> := [];
+
+   //  Set of constant declarations
+   var Const_Decls : Set<String> := [];
+
+   //  Keep track of locally defined funcs, so we know what to declare
+   var Local_Funcs : Set<String> := [];
+
+   //  PSIR PC within current function
+   var PC : Int := 0;
+
+   //  "" if not inside function
+   //  Otherwise, it's name of function being defined
+   var Fn_Name : String := "";
+
+   //  "" if not inside block
+   //  Otherwise, it's name of block being defined
+   var Block_Name : String := "";
+
+   //  Index into LLVM at the start of this func
+   var Fn_Start : Int := 0;
+
+   //  How much to indent upon entering a func
+   var Fn_Indent : Int := 0;
+
+   //  Keep track of locations of #Begin_Nested_Block_Ops
+   //  (and some information about them)
+   var Nested_Blocks : Map<Int, Reflection::Code_Block_Info> := [];
+
+   var Constant_Streams : optional
+     Map<String, Info_Stream<Reflection::Streamable_Value>> := null
+
+   interface Op_Info<> is
+      const Module_Name_Local_Index : Int;
+      const Op_Name_Local_Index     : Int;
+      const Has_Internal_Precond    : Bool;
+      const Uses_Queuing            : Bool;
+   end interface Op_Info;
+
+   //  module-name-local-index and operation-name-local-index,
+   //  has_internal_precond, uses_queuing
+   var Module_Op_Info : Map<String, Op_Info> := [];
+
+   //  Metadata Nodes created during compilation to be
+   //  Printed during Dump()
+   //  Contains entire assignment statement and newline
+   //  Ex: "!1 = metadata !{i32 0}\n"
+   var MD_Nodes : ZVector<String> := [];
+
+   //  Map from Line and Col to metadata name (!4 for example).
+   //  Use Create_Key() to make key for this map
+   //  from the Line and Column numbers
+   var Source_Position_Nodes : Map<Int, String> := [];
+
+   //  Subprogram metadata node names
+   //  Names only here, Assignment statement is in MD_Nodes
+   var Subprogram_MDs : ZVector<String> := [];
+   
+   //  Initially is Number of nodes assigned manually at end of Dump()
+   //  Increments on each new creation afterwards
+   var Num_MD_Nodes : Int := 5;
+
+   //  A debug metadata node with the subprogram descriptor of the
+   //  function currently being compiled
+   var Current_Subprogram_MD : String := "";
+
+   //  A debug metadata node with Source Position of current PSVM Instruction
+   var Current_Source_Position_MD : String := "";
+
+   //  Flag to indicate whether we're done compiling instructions
+   //  and onto top of file initializations
+   var Top_Of_File : Bool := #false;
+
+   /////////////// TODO /////////////
+   //  Use Code_Index
+   //////////////////////////////////
+
+   //  Begin_Nested_Block is a bit of a misnomer,
+   //  It's used to begin both Functions and Nested_Blocks
+   //  Define the function, initialize the stack, and initialize the region
+   func Begin_Nested_Block(var P : LLVM_Printer; Name : String;
+                           Frame_Size : Int; Uses_Rgn : Bool;
+                           Nested_Block : Bool; Line_Number : Int;
+                           Is_Internal : Bool)
+                           -> ZVector<String> is
+      //  Nested blocks are internal and return an i32
+      //  Functions are not internal and return void
+      var Visibility := " ";
+      var Return := "void";
+      if Is_Internal then
+         Visibility := " internal ";
+      end if
+      if Nested_Block then
+         Return := "i32"; //  Level_Diff = top 16 bits, Skip_Count = bottom 16
+      end if
+      const Def : String := "define" | Visibility | Return | " @" | Name |
+           "(i64* %_Context, i64* %_Param_Area, i64* %_Static_Link) {\n";
+      var Result : ZVector<String> := Create(1, Def);
+      func Add(S : String) is
+         const To_Add := (" " * P.Fn_Indent) | S | "\n";
+         Result |= To_Add;
+      end func Add
+
+      //  Build subprogram descriptor metadata node for debugging information
+      if P.Debug then
+         P.Num_MD_Nodes += 1;
+         const Node_Name := "!" | P.Num_MD_Nodes;
+         const Node_Value := "metadata !{i32 46, " | //  subprogram tag
+            "metadata !1, " | //  Source directory and file name
+            "null, " | //  TODO: Context descriptor
+            "metadata !" | Name | ", " | //  function name
+            "metadata !" | Name | ", " | //  display name (TODO?)
+            "metadata !" | Name | ", " | //  mips linkage name (TODO?)
+            "i32 " | Line_Number | ", " |
+            "null, " | //  TODO: Type descriptor
+            "i1 " | (Is_Internal? 1 : 0) | ", " | //  internal
+            "i1 1, " |  //  defined here? always yes
+            "i32 0, " | //  virtuality (?)
+            "i32 0, " | //  index into virtual function (?)
+            "null, " |  //  which base type (?)
+            "i32 0, " | //  Flags (none)
+            "i1 0, " |  //  TODO: Optimized
+            Return | "(i64*, i64*, i64*)* @" | Name | ", " | //  function
+            "null, " | //  function template parameters (?)
+            "null, " | //  function declaration descriptor (?)
+            "null, " | //  list of function variables
+            "i32 " | Line_Number | //  where scope begins
+            "}\n";
+         const Assignment := Node_Name | " = " | Node_Value;
+         //  Add to vector of all metadata nodes
+         P.MD_Nodes |= Assignment;
+         //  Add name to Subprogram metadata nodes
+         P.Subprogram_MDs |= Node_Name;
+         //  Set the current subprogram metadata node
+         P.Current_Subprogram_MD := Node_Name;
+      end if
+
+      //  Allocate local area with Frame_Size number of 64 bit words
+      Add("%_Local_Area = alloca i64, i64 " | Frame_Size);
+      //  Store static link ptr in 0th location
+      //  Store param area ptr in 1st location
+      Add("%_sl = ptrtoint i64* %_Static_Link to i64");
+      Add("%_pa = ptrtoint i64* %_Param_Area to i64");
+      Add("store i64 %_sl, i64* %_Local_Area");
+      Add("%_store_pa = getelementptr i64* %_Local_Area, i64 1");
+      Add("store i64 %_pa, i64* %_store_pa");
+
+      //  Initialize Storage Region if necessary
+      if Uses_Rgn then
+         Add("call void @_psc_initialize_stg_rgn" | 
+             "(i64* %_Context, i64* %_Local_Area)");
+      end if
+      return Result;
+   end func Begin_Nested_Block
+
+   //  Return the block info of the block that, the PSVM index, I is in
+   //  If not in a block, return null
+   func Block_Info(P : LLVM_Printer; I : Code_Index) -> 
+      optional Reflection::Code_Block_Info is
+      var Block_Start_Index : optional Int := null
+      for K in Keys(P.Nested_Blocks) loop
+         if I >= K then
+            //  Find last Begin_Nested_Block that precedes I (if at all)
+            Block_Start_Index := Max(Block_Start_Index, K);
+         end if
+      end loop
+      if Block_Start_Index not null and then
+         Block_Start_Index in P.Nested_Blocks then
+         //  In a block: return information about it
+         return P.Nested_Blocks[Block_Start_Index];
+      end if
+      //  Not in a block
+      return null;
+   end func Block_Info
+
+   //  Split a string on last instance of Split_On
+   //  Used to split a full file name into a directory and name pair
+   func Split_On_Last(S : String; Split_On : Set<Char>)
+      -> Pair<String, String> is
+      for each [I => C] of S reverse loop
+         if C in Split_On then
+            //  Include Split_On in first
+            return (S[1 .. I], S[I + 1 .. |S|]);
+         end if
+      end loop
+      //  Split_On not in S
+      return ("", S);
+   end func Split_On_Last
+
+   //  returns true if the string contains
+   //  the given character
+   func Contains(S : String; X : Char) -> Bool is
+      for each C of S concurrent loop
+         if C == X then
+            return #true;
+         end if
+      end loop
+      return #false;
+   end func Contains
+
+   //  Create a new source position metadata and return its metadata identifier
+   func Source_Position_Metadata(var P : LLVM_Printer; L, C : Int) -> String is
+      P.Num_MD_Nodes += 1;
+      const Node_Name := "!" | P.Num_MD_Nodes;
+      const Node := "metadata !{i32 " | L |
+         ", i32 " | C | ", " |
+         "metadata " | P.Current_Subprogram_MD |
+         ", null}\n";
+      const Assignment := Node_Name | " = " | Node;
+      P.MD_Nodes |= Assignment; 
+      return Node_Name;
+   end func Source_Position_Metadata
+
+   //  Univ_Integer, aka Int, is 64 bits
+   //  Line will never exceed 2**48
+   //  Column will never exceed 2**16
+   //  this is fine
+   func Create_Key(Line, Col : Int) -> Int is (Line * (2**16) + Col);
+
+   //  Append To_Add to Add_To and stay under 80 chars per line
+   //  if possible without splitting up To_Add
+   func Under_Eighty(var Add_To : String; var Chars_This_Line : Int;
+         To_Add : String) is
+      const Len := Length(To_Add);
+      Chars_This_Line += Len;
+      if Chars_This_Line > 79 then
+         //  To many, move down to next line.
+         Add_To |= "\n";
+         Chars_This_Line := Len;
+         //  We're going to add To_Add, so thise line will have
+         //  Len number of characters after this
+      end if
+      Add_To |= To_Add;
+   end func Under_Eighty;
+
+   exports
+
+   func Create(N_Spaces : Int; LLVM_Debug, Optimize : Bool) -> LLVM_Printer is
+      // Create PFT/PFS; let all others default except Fn_Indent
+      var Dummy : Univ_Integer := 0;  // Ensure "Create" for PFS not a const
+      return (PFT => Create(), PFC => Create(), PFS => Create(Dummy),
+         Fn_Indent => N_Spaces,
+         Debug => LLVM_Debug, Optimize => Optimize)
+   end func Create
+
+   //  Add llvm instruction to buffer.
+   func Add_Instr(var P : LLVM_Printer; Instr : String) is
+      //  Put line number debug information at end of line
+      //  if LLVM_Printer::Debug is set to true
+      if Verbose_Debug then
+         Println ("--> Add_Instr " | P.Fn_Name | ", Instr = " | Instr)
+      end if
+      var BD : String := "";
+      if Verbose_Debug then
+         Print ("--- Add_Instr after declaring BD in ")
+         Println (P.Fn_Name)
+      end if
+      var MD : String := "";
+      if Verbose_Debug then
+         Print ("--- Add_Instr before checking P.Top_Of_File in ")
+         Println (P.Fn_Name)
+      end if
+      if (not P.Top_Of_File and P.Debug) and then 
+         not Contains(Instr, ':') then
+         //  Labels contain a single colon
+         //  and !dbgs are only valid on instructions
+         MD := ", !dbg " | P.Current_Source_Position_MD;
+         if Verbose_Debug then
+            Print ("--- Add_Instr " | P.Fn_Name)
+            Println (", MD = " | MD)
+         end if
+      end if
+
+      //  Precede with indentation
+      //  Follow with metadata node (if P.Debug) and a newline
+      if Verbose_Debug then
+         Print ("--- Add_Instr before computing To_Add in ")
+         Println (P.Fn_Name)
+      end if
+      const To_Add := P.Indent | Instr | MD | '\n';
+      if Verbose_Debug then
+         Print ("--- Add_Instr ")
+         Print (P.Fn_Name)
+         Println (", To_Add = '" | To_Add | "'")
+      end if
+      P.Buffer |= To_Add;
+      if Verbose_Debug then
+         Println ("<-- Add_Instr " | P.Fn_Name)
+      end if
+   end func Add_Instr
+
+   //  Add zvector of code to top of file.
+   func Add_Vec(var P : LLVM_Printer; Vec : ZVector<String>) is
+      {P.Top_Of_File}
+      if Verbose_Debug then
+         Println ("<-- Add_Vec " | P.Fn_Name)
+      end if
+      P.Buffer |= Vec;
+      if Verbose_Debug then
+         Println ("<-- Add_Vec " | P.Fn_Name)
+      end if
+   end func Add_Vec
+
+   //  Source_File_Name is used for debug information
+   //  Output_File_Name is where the llvm code will be written to
+   func Dump(var P : LLVM_Printer;
+      Source_File_Name, Output_File_Name : String) is
+      if Verbose_Debug then
+         Println ("--> LLVM::Dump " | P.Fn_Name)
+      end if
+      //  Print declarations, tables, and instructions to file
+      var IO := IO::Get_IO();
+
+      //  File to output llvm code to
+      var Stream : File_Output_Stream := Create(IO, Output_File_Name);
+
+      if Stream is null then
+         IO.Stderr.Println("Error: Cannot create " | Output_File_Name);
+         IO.Set_Exit_Status(IO::Exit_Failure);
+         return;
+      end if
+
+      //  Used to know if loops are entered so newlines can be printed
+      var Entered : Bool := #false;
+
+      //  Put declarations for external funcs at top of file
+      if Debug_Decls then
+         for Decl in P.Decls {Decl in P.Local_Funcs} loop
+            Println(" Not declaring " | Decl | " because in Local_Funcs");
+         end loop
+      end if;
+
+      for Decl in P.Decls {Decl not in P.Local_Funcs} loop
+         Entered := #true;
+         Stream.Print("declare " | Decl | "\n");
+      end loop
+      if Entered then
+         Stream.Print("\n");
+         Entered := #false;
+      end if
+
+      //  Output constant table
+      {P.Constant_Streams not null}  // Should have been init'ed
+
+      for each [Name => Val_Stream] of P.Constant_Streams loop
+         Entered := #true;
+         Stream.Print("@\"" | Name | "$stream\" = internal constant [" |
+            Length(Val_Stream) | " x i8]");
+         for each Str of To_String_Vec(Val_Stream) forward loop
+            Stream.Print(Str);
+         end loop
+         Stream.Print('\n');
+      end loop
+
+      //  Declare referenced constants not defined in this file
+      for Name in P.Const_Decls { Name not in P.Constants } loop
+         Entered := #true;
+         Stream.Print("@\"" | Name | "\" = external global i64\n");
+      end loop
+
+      if Entered then
+         Stream.Print("\n");
+         Entered := #false;
+      end if
+
+      //  Print out Module, Op indices and local func table
+      //  These tables are used by the RTS to register the compiled routines
+      //  in this file
+      if Count(P.Module_Op_Info) > 0 then
+         const Func_Type := "void(i64*, i64*, i64*)*";
+         const Block_Type := "i32(i64*, i64*, i64*)*";
+         var Indices := "@$Module_Op_Indices = internal constant [" | 
+            (Count(P.Module_Op_Info) * 2) | " x i16] [\n";
+         var Names := "@$Local_Funcs = internal constant [" |
+            Count(P.Module_Op_Info) | " x " | Func_Type | "] [\n";
+         var Uses_Queuing_Table :=
+            "@$Local_Funcs_Use_Queuing = internal constant [" |
+            Count(P.Module_Op_Info) | " x i8] [\n";
+         const IP_Indices_Header :=
+            "@$Internal_Precond_Indices = internal constant [";
+         var IP_Indices := " x i16] [\n";
+         const IP_Names_Header :=
+            "@$Internal_Precond_Blocks = internal constant [";
+         var IP_Names := " x " | Block_Type | "] [\n";
+         var Chars_This_Line_Indices := 0;
+         var Chars_This_Line_Names := 0;
+         var Chars_This_Line_Queuing := 0;
+         var Chars_This_Line_IP_Indices := 0;
+         var Chars_This_Line_IP_Names := 0;
+         var Num_IPs := 0;
+         for (each [Name => Info] of P.Module_Op_Info;
+            Sep := "" then ", "; I := 1 then I + 1) loop
+
+            //  Add indices
+            const To_Add_Indices :=
+               Sep | "i16 " | Info.Module_Name_Local_Index |
+                   ", i16 " | Info.Op_Name_Local_Index;
+            Under_Eighty(Indices, Chars_This_Line_Indices, To_Add_Indices);
+            
+          ||
+
+            //  Add name to table of names
+            const To_Add_Names := Sep | Func_Type | " " | Name;
+            Under_Eighty(Names, Chars_This_Line_Names, To_Add_Names);
+
+          ||
+
+            //  Add uses-queuing flag to table
+            const To_Add_Queuing := Sep | "i8 " | (Info.Uses_Queuing - #false);
+            Under_Eighty(Uses_Queuing_Table, Chars_This_Line_Queuing,
+              To_Add_Queuing);
+
+          ||
+
+            //  Add Internal_Precondition names and indices
+            //  Indices are indicating which local function this
+            //  Internal_Precondition corresponds to
+            if Info.Has_Internal_Precond then
+               const IP_Sep := (Num_IPs == 0? "" : ", ");
+               Num_IPs += 1;
+               const To_Add_IP_Indices := IP_Sep | "i16 " | I;
+               const To_Add_IP_Names := IP_Sep | Block_Type | " " |
+                  P.Get_Block_Name(0, #true, Name);
+               Under_Eighty(IP_Indices, Chars_This_Line_IP_Indices,
+                  To_Add_IP_Indices);
+               Under_Eighty(IP_Names, Chars_This_Line_IP_Names,
+                  To_Add_IP_Names);
+            end if
+         end loop
+         Indices |= "]\n\n";
+         Stream.Print(Indices);
+
+         Names |= "]\n\n";
+         Stream.Print(Names);
+
+         Uses_Queuing_Table |= "]\n\n";
+         Stream.Print(Uses_Queuing_Table);
+
+         IP_Indices := IP_Indices_Header | Num_IPs | IP_Indices | "]\n\n";
+         Stream.Print(IP_Indices);
+
+         IP_Names := IP_Names_Header | Num_IPs | IP_Names | "]\n\n";
+         Stream.Print(IP_Names);
+      end if
+
+      //  Per file tables will be in Buffer
+      //  Because they are added after last instruction in file
+      for each S of P.Buffer forward loop
+         Entered := #true;
+         Stream.Print(S);
+      end loop
+      if Entered then
+         Entered := #false;
+         Stream.Print("\n");
+      end if
+
+      //  Dump all the generated llvm instructions
+      for each Instr of P.LLVM forward loop
+         for each S of Instr forward loop
+            Stream.Print(S);
+         end loop
+      end loop
+
+      if P.Debug then
+         const Dir_Name := Split_On_Last(Source_File_Name, ['/', '\\']);
+
+         Stream.Print("!llvm.dbg.cu = !{!0}\n");
+         Stream.Print("!llvm.module.flags = !{!4, !5}\n");
+
+         //  Debug information at the end of the file
+         //  !0 Compile unit
+         Stream.Print("!0 = metadata !{i32 17, " | //  tag
+            "metadata !1, " |       //  File directory and name
+            "i32 12, " |            //  use C99 for dwarf lang ID for now
+            "metadata !\"ParaSail Compiler\", " | //  TODO: Version
+            "i1 false, " |          //  Optimized
+            "metadata !\"\", " |    //  Flags
+            "i32 0, " |             //  Runtime version (TODO)
+            "metadata !2, " |       //  enums (!2 is empty for now)
+            "metadata !2, " |       //  retained types (what is this?)
+            "metadata !3, " |       //  List of subprograms
+            "metadata !2, " |       //  Global variables
+            "metadata !2, " |       //  Imported entities
+            "metadata !\"\"}\n");   //  Split debug filename
+
+         //  !1 directory and file name pair
+         Stream.Print("!1 = metadata !{metadata !\"" |
+            Dir_Name.Second | "\", " | "metadata !\"" |
+            Dir_Name.First | "\"}\n");
+
+         //  !2 empty catch-all for now
+         Stream.Print("!2 = metadata !{i32 0}\n");
+
+         //  !3 is the list of subprograms
+         if Length(P.Subprogram_MDs) > 0 then
+            Stream.Print("!3 = metadata !{");
+            for (each MD_Name of P.Subprogram_MDs; Sep := "" then ", ")
+               forward loop
+               Stream.Print(Sep | "metadata " | MD_Name);
+            end loop
+            Stream.Print("}\n");
+         else
+            Stream.Print("!3 = metadata !{i32 0}\n");
+         end if
+
+         //  !4 and !5 are dwarf version information
+         Stream.Print("!4 = metadata !{" |
+            "i32 2, metadata !\"Dwarf Version\", i32 4}\n");
+         Stream.Print("!5 = metadata !{" |
+            "i32 1, metadata !\"Debug Info Version\", i32 1}\n");
+
+         //  All the rest of the metadata nodes
+         for each MD_Assignment of P.MD_Nodes forward loop
+            Stream.Print(MD_Assignment);
+         end loop
+      end if
+      Stream.Close();
+      if Verbose_Debug then
+         Println ("<-- LLVM::Dump " | P.Fn_Name)
+      end if
+   end func Dump
+
+   func Begin_Function(var P : LLVM_Printer; Fn_Name : String;
+                       Frame_Size : Int; Uses_Rgn : Bool; Line_Number : Int;
+                       Is_Internal : Bool) is
+      if Verbose_Debug then
+         Println ("--> LLVM::Begin_Function " | Fn_Name |
+           " (P.Fn_Name=" | P.Fn_Name | ")")
+      end if
+      //  Define this function and allocate the stack frame
+      //  Main_Arg indicates whether the function has one argument of type
+      //  Basic_Array<String> and no return type
+      //  Uses_Rgn indicates whether a Storage region needs to be initialized
+
+      //  llvm does not allow nested functions
+      //  So, use End_Function, before you start a new one
+      if P.Fn_Name != "" then
+         var IO := IO::Get_IO();
+         IO.Stderr.Println("Error: Internal: More than one Begin_Function " |
+            "call before an End_Function call");
+         {#false};
+      end if
+      P.Block_Name := "";
+
+      //  An llvm function takes three pointers and always returns void
+      //  Context holds useful stuff for RTS builtins
+      //  Param_Area holds space for incoming and outgoing values,
+      //  Static_Link is a pointer to the local area of the enclosing
+      //  block or operation
+      P.Fn_Name := Fn_Name;
+      
+      if Uses_Rgn then
+        P.Decls |= "void @_psc_initialize_stg_rgn(i64*, i64*)";
+      end if
+
+      //  Begin_Nested_Block handles actually defining the function
+      //  and allocating the stack frame, stg_rgn, etc.
+      P.Buffer := P.Buffer | Begin_Nested_Block(P, Fn_Name, Frame_Size,
+         Uses_Rgn, Nested_Block => #false, Line_Number => Line_Number,
+         Is_Internal => Is_Internal);
+      
+      P.Indent := P.Fn_Indent * " ";
+      const Header := "void @" | Fn_Name | "(i64*, i64*, i64*)";
+      P.Local_Funcs |= Header;
+
+      //  Frame and Region allocation counts as its own instruction
+      //  even though it's not actually a PSIR instruction
+      //  This ensures that labels can only be placed inside
+      //  this function
+      P.PC := 0;
+      P.Labels := [];
+      P.Next_PSIR_Instr();
+      if Verbose_Debug then
+         Println ("<-- LLVM::Begin_Function " | P.Fn_Name)
+      end if
+   end func Begin_Function
+
+   func End_Function(var P : LLVM_Printer) is
+      //  Add closing brace, reset function specific variables,
+      //  and place labels
+
+      if Verbose_Debug then
+         Println (" Inside End_Function, P.Fn_Name = " | P.Fn_Name)
+      end if
+
+      //  If Name is empty, Begin_Function wasn't called
+      if P.Fn_Name == "" then
+         var IO := IO::Get_IO();
+         IO.Stderr.Println("Error: Internal:" | 
+            "End_Function called with no preceding Begin_Function");
+         {#false};
+      end if
+      P.Block_Name := "";
+
+      P.Indent := "";
+      P.LLVM[Length(P.LLVM) - 1] |= "}\n\n";
+      P.Fn_Name := "";
+
+      for Loc in P.Labels concurrent loop
+         //  concurrent safe because Labels has no duplicates
+         const I := P.Fn_Start + Loc;
+         P.LLVM[I][0] := "_lbl" | Loc | ":\n" | P.LLVM[I][0];
+      end loop
+
+      P.Fn_Start += P.PC; 
+      P.Nested_Blocks := [];
+      P.Labels := [];
+   end func End_Function
+
+   func Add_Label(var P : LLVM_Printer; Skip_Amt : Int) 
+         -> String is
+      //  Add a label within this function
+      //  Skip_Amt ahead of current PC
+      //  Labels added to buffer when function ends
+      const Target := P.PC + Skip_Amt + 1;
+      P.Labels |= Target
+      return "%_lbl" | Target;
+   end func Add_Label
+
+   func Has_Label(P : LLVM_Printer;
+                  R : Countable_Range<Int>) -> Bool is
+      for I in R concurrent loop
+         if I in P.Labels then
+            return #true;
+         end if
+      end loop
+      return #false;
+   end func Has_Label
+
+   func Peek(P : LLVM_Printer; I : Int) -> ZVector<String> is
+      return P.LLVM[P.Fn_Start + I];
+   end func Peek
+
+   func Edit(var P : LLVM_Printer; I : Int;
+             New_Instrs : ZVector<String>) is
+      P.LLVM[P.Fn_Start + I] := New_Instrs;
+   end func Edit
+
+   //  Call when moving to next PSIR instruction and
+   //  after function initialization
+   //  Use like this:
+   //  function signature, allocate stack, and allocate region
+   //  Next_PSIR_Instr(P);
+   //  for Instr in Instructions forward loop
+   //     Compile(Instr);
+   //     Next_PSIR_Instr(P);
+   //  end loop
+   func Next_PSIR_Instr(var P : LLVM_Printer) is
+      const Len := |P.Buffer|;
+      if Len > 0 then
+         P.Buffer[Len - 1] |= "\n";
+      end if
+      P.LLVM |= P.Buffer;
+      P.Buffer := [];
+      P.PC += 1;
+   end func Next_PSIR_Instr
+
+   func Declare(var P : LLVM_Printer; D : String) is
+      //  Will only actually get declared if the function isn't in this file
+      //  So declare all functions you call just in case it's not local
+      const Orig_Num_Decls := |P.Decls|;
+      P.Decls |= D;
+      if Debug_Decls and then |P.Decls| > Orig_Num_Decls then
+         Println(" Adding " | D | " to Decls");
+      end if;
+        
+   end func Declare
+   
+   func Begin_Nested_Block_Op(var P : LLVM_Printer; I : Code_Index;
+      CBI : Reflection::Code_Block_Info; Is_Internal_Precond : Bool) is
+
+      P.Nested_Blocks[I] := CBI;
+      const Block_Name := P.Get_Block_Name(I, Is_Internal_Precond);
+      P.Block_Name := Block_Name;
+
+      //  End_Nested_Block (or end function body)
+      P.Buffer |= "}\n\n";
+
+      //  Begin a new Nested Block
+      if CBI.Uses_Stg_Rgn then
+        P.Declare("void @_psc_initialize_stg_rgn(i64*, i64*)");
+      end if
+
+      if Is_Internal_Precond then
+         const Header := "i32 @" | Block_Name | "(i64*, i64*, i64*)";
+         P.Local_Funcs |= Header;
+      end if
+
+      //  Put into Vector of instructions
+      const Block_Header := Begin_Nested_Block(P, Block_Name,
+         CBI.Frame_Size, CBI.Uses_Stg_Rgn, Nested_Block => #true,
+         Line_Number => CBI.Source_Line_Number,
+         //  Internal Preconditions must be externally visible
+         Is_Internal => not Is_Internal_Precond);
+      P.Buffer |= Block_Header;
+
+   end func Begin_Nested_Block_Op
+
+   func In_Nested_Block(P : LLVM_Printer; I : Code_Index) -> Bool is
+      //  Use map-reduce to find index of first Nested_Block
+      const First_Block := 
+         (for K in Keys(P.Nested_Blocks) => Min(<null>, K));
+      //  if N isn't null then Min(null, N) returns N
+      //  That's why the initial value is null
+      //  First block will remain null if there are no nested blocks
+      if First_Block not null then
+         //  I is in a block (not neccessarily the first) if it is greater than
+         //  the index of the first block
+         return I >= First_Block;
+      end if
+      //  Not in a block
+      return #false;
+   end func In_Nested_Block
+
+   func Get_Block_Name(P : LLVM_Printer; I : Code_Index;
+         Is_Internal_Precond : Bool;
+         Callee_Name : optional String := null) -> Name : String is
+      const Append : String := (Is_Internal_Precond? ".0internal_precond" :
+                                                     "." | I | "block");
+      const Name_To_Add_To := (Callee_Name is null? P.Fn_Name : Callee_Name);
+      if Name_To_Add_To[|Name_To_Add_To|] == '"' then
+         //  quotes already on name, add inside the quotes
+         Name := Name_To_Add_To[1 ..< |Name_To_Add_To|] | Append | '"';
+      else
+         //  no quotes, just append it
+         Name := Name_To_Add_To | Append;
+      end if
+   end func Get_Block_Name
+
+   func Block_Uses_Rgn(P : LLVM_Printer; I : Code_Index) -> Bool is
+      const Info := Block_Info(P, I);
+      if Info not null then
+         return Info.Uses_Stg_Rgn;
+      else
+         return #false;
+      end if
+   end func Block_Uses_Rgn
+
+   func Block_Nested_Level(P : LLVM_Printer; I : Code_Index) -> optional Int is
+      const Info := Block_Info(P, I);
+      if Info not null then
+         return Info.Nested_Level;
+      else
+         return null;
+      end if
+   end func Block_Nested_Level
+
+   func Add_Constant(var P : LLVM_Printer; Name : String; 
+      Val : Reflection::Streamable_Value) is
+      //  Add to the map of constant names to constant values
+      //  Values will later be streamed
+      P.Constants[Name] := Val;
+   end func Add_Constant
+
+   func Get_Constants(var P : LLVM_Printer) -> Result : Map<String, Int> is
+      //  Result is a mapping from constant names to
+      //  lengths of their corresponding streams
+      //  As a side-effect, build up Constant_Streams mapping.
+      Result := [];
+      if P.Constant_Streams is null then
+         P.Constant_Streams := [];
+      end if
+      for each [Name => Val] of P.Constants loop
+         const Val_Info := Const_Info_For_Value (Val);
+         const Val_Type := Val_Info.Data.Type_Desc;
+         if Is_Small(Val_Type)
+           or else Type_Kind(Val_Type) == #univ_string
+         then
+            //  No need to create a stream for this constant
+            //  as it is a small value or a string.
+            //  Add an entry with a zero size to the mapping.
+            Result[Name] := 0;
+         else
+            //  This constant has a large, non-string value
+            //  Generate a stream representation of it and add its size to
+            //  mapping.
+            var Val_Stream for P.Constant_Streams := Stream (Val, P.PFS);
+            Result[Name] := Length(Val_Stream);
+            P.Constant_Streams[Name] <== Val_Stream;
+         end if;
+      end loop
+      //  Don't need a return statement because we're using a named result
+   end func Get_Constants
+
+   func Create_Anon_Const_Stream(var P : LLVM_Printer;
+      Anon_Const_Name : String;
+      Anon_Const_Val  : Reflection::Streamable_Value) -> Result : Int is
+      //  Create stream for anon constant if large, non-string.
+      //  Add stream to Constant_Streams and return length of stream if large.
+      //  Return 0 if small or string.
+      const Val_Info := Const_Info_For_Value (Anon_Const_Val);
+      const Val_Type := Val_Info.Data.Type_Desc;
+      if Is_Small(Val_Type)
+        or else Type_Kind(Val_Type) == #univ_string
+      then
+         Result := 0;
+      else
+         if P.Constant_Streams is null then
+            //  Init Constant_Streams mapping now.
+            P.Constant_Streams := [];
+         end if
+
+         var Val_Stream for P.Constant_Streams :=
+            Stream (Anon_Const_Val, P.PFS);
+         Result := Length(Val_Stream);
+         P.Constant_Streams[Anon_Const_Name] <== Val_Stream;
+      end if
+   end func Create_Anon_Const_Stream
+
+   func Add_Module_Op(var P : LLVM_Printer;
+      Module_Name, Op_Name, LLVM_Name : String;
+      Has_Internal_Precond, Uses_Queuing : Bool) is
+      //  Keep track of module and Operation indices
+      //  so functions in this file can be registered with the RTS
+      //  Also record Has_Internal_Precond and Uses_Queuing flags for the func.
+      var Module : Int;
+      if Module_Name is null then
+         Module := P.PFS.Get_Local_Index("");
+      else
+         Module := P.PFS.Get_Local_Index(Module_Name);
+      end if
+      const Op := P.PFS.Get_Local_Index(Op_Name);
+      P.Module_Op_Info[LLVM_Name] :=
+        (Module_Name_Local_Index => Module,
+         Op_Name_Local_Index     => Op,
+         Has_Internal_Precond    => Has_Internal_Precond,
+         Uses_Queuing            => Uses_Queuing);
+   end func Add_Module_Op
+
+   func Module_Op_Info_Size(P : LLVM_Printer) -> Int is
+      return Count(P.Module_Op_Info);
+   end func Module_Op_Info_Size
+
+   func Num_Internal_Preconds(P : LLVM_Printer) -> Result : Int is
+      Result := 0;
+      for each Info of P.Module_Op_Info loop
+         if Info.Has_Internal_Precond then
+            Result += 1;
+         end if
+      end loop
+      //  Named result, no need to use 'return'
+   end func Num_Internal_Preconds
+
+   func Declare_Const(var P : LLVM_Printer; Name : String) is
+      P.Const_Decls |= Name;
+   end func Declare_Const
+
+   //  Declare an anonymous constant; return its index in table of local
+   //  constants.
+   func Decl_Anon_Const(var P : LLVM_Printer;
+     Locator : Reflection::Object_Locator; Info : Reflection::Const_Info)
+     -> Per_File_Constants::Local_Index is
+      { Base(Locator) == Reflection::Object_Locator::Const_Area }
+      return P.PFC.Get_Local_Index(Const_Value_At_Locator (Locator))
+   end func Decl_Anon_Const
+
+   func Has_Func(P : LLVM_Printer; Name : String) -> Bool is
+      (("void @" | Name | "(i64*, i64*, i64*)") in P.Local_Funcs);
+
+   func Set_Debug(var P : LLVM_Printer; L, C : Int) is
+      const K := Create_Key(L, C);
+      //  No need to use File name as well, because each file has it's own
+      //  LLVM_Printer
+      if K in Keys(P.Source_Position_Nodes) then
+         //  Seen before, retrieve it
+         P.Current_Source_Position_MD := P.Source_Position_Nodes[K];
+      else
+         //  Create a new Source Position Metadata
+         const New_Node := P.Source_Position_Metadata(L, C);
+
+         //  Set as current and add to mapping
+         P.Current_Source_Position_MD := New_Node;
+         P.Source_Position_Nodes[K] := New_Node;
+      end if
+   end func Set_Debug
+
+   func Begin_Top_Of_File_Initializations(var P : LLVM_Printer) is
+      P.Top_Of_File := #true;
+   end func Begin_Top_Of_File_Initializations
+
+end class PSC::LLVM_Printer

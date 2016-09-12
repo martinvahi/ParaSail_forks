@@ -1,0 +1,39 @@
+It is time to create some sort of ParaSail debugger.  Initially it
+should support the interpreter, but eventually it would be nice
+if a failure in compiled code could also drop the user into the
+debugger, at least under some conditions.
+
+The debugger needs to be able to display the status of things, 
+for each server/picothread, be able to go up and down the stack,
+show the set of local variables, show the contents of local variables
+in any stack frame, single step, stop at a breakpoint.
+
+For compiled code, single stepping seems less critical, but being able
+to take control on a failure, and walk up and down the stack, displaying
+local and global variables seems very useful.
+
+All of this implies having some sort of symbol table associated with a
+routine, so we know what is where on the stack (or in an LLVM register?).
+We probably want to know which local addresses are always "stored through"
+if it is too hard to keep track of registers.  In "debug mode" we would
+store through all stack slots associated with named variables, during
+their lifetime.
+
+The debugger and the read/eval/print interpreter should share as much
+as possible, including a history, etc.
+
+The "program" being written in the read/eval/print interpreter should itself
+be compiled to PSVM, and potentially be saved into a file (or always be
+written into a temp file?).
+
+When we enter the debugger, we should "quiesce" all of the other servers.
+This might be done by adding a special picothread onto all of the servers
+queue, which will wait until the debugger allows them to proceed again.
+
+---  13-Sep-2015
+
+To get started, we want to be able to stop at assertion failures
+or other failures and look around.  It would also be nice to have
+some kind of trace buffer so we could see what happened just before
+the failure.  A decent trace-back would be very nice, and we could
+produce that even if we don't stop at an assertion failure.

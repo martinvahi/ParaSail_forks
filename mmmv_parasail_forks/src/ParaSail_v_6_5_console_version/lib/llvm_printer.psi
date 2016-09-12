@@ -1,0 +1,167 @@
+import PSC::*, PSL::Short_Names::*
+
+//  Use one LLVM_Printer for each input file
+interface PSC::LLVM_Printer<> is
+   type Code_Index is Reflection::Routine::Code_Index
+
+   var PFT : Reflection::Per_File_Table<Reflection::Type_Descriptor>
+   type Per_File_Constants is
+     Reflection::Per_File_Table<Reflection::Streamable_Value>
+   var PFC : Per_File_Constants
+   var PFS : Per_File_String_Table<>
+   
+   //  Map from names of constants to their values
+   var Constants : Map<String, Reflection::Streamable_Value> := [];
+
+   //  ParaSail Source level debugging information in the llvm
+   var Debug : Bool;
+
+   //  llvm code-gen level optimizations
+   //  Right now, The only thing this enables is
+   //  A conversion from calls on =? and to_bool to an llvm cmp instruction
+   var Optimize : Bool;
+
+   //  TBD: per-file tables for Routines (maybe?)
+
+   //  Create a new printer
+   //  Each file should have its own printer
+   //  llvm functions will indent N_Spaces
+   func Create(N_Spaces : Int; LLVM_Debug, Optimize : Bool) -> LLVM_Printer;
+
+   //  Add an llvm instruction to the buffer
+   //  Code added to the LLVM_Printer after the last instruction will
+   //  be put at the top of the file
+   //  One newline will be added after the given String
+   func Add_Instr(var P : LLVM_Printer; Instr : String);
+   op "|="(var P : LLVM_Printer; Instr : String) is Add_Instr;
+
+   //  Add zvector of code to top of file.
+   //  One newline will be added after the given vector
+   func Add_Vec(var P : LLVM_Printer; Vec : ZVector<String>);
+   op "|="(var P : LLVM_Printer; Vec : ZVector<String>) is Add_Vec;
+
+   //  Dump to file
+   //  Don't use one Printer on multiple input files
+   func Dump(var P : LLVM_Printer; Source_File_Name, Output_File_Name : String)
+
+   //  Define function and necessary initialization
+   func Begin_Function(var P : LLVM_Printer; Fn_Name : String;
+                       Frame_Size : Int; Uses_Rgn : Bool; Line_Number : Int;
+                       Is_Internal : Bool);
+
+   //  Add closing brace, place labels,
+   //  and reset function specific internal variables
+   func End_Function(var P : LLVM_Printer);
+
+   //  Add a label to be jumped to and return the label name, including the '%'
+   //  Skip_Amt is in units of PSIR instructions, not llvm instructions
+   func Add_Label(var P : LLVM_Printer;
+                  Skip_Amt : Int) -> String;
+
+   //  Probe for a label in this range
+   //  Only knows about labels added via Add_Label.
+   //  Labels defined manually will not be detected.
+   func Has_Label(P : LLVM_Printer;
+                  R : Countable_Range<Int>) -> Bool;
+
+   //  Peek/Edit the string for the PSIR instruction at I relative to 
+   //  the beginning of this function
+   //  Must be called between Begin_Function and End_Function
+   func Peek(P : LLVM_Printer;
+             I : Int) -> ZVector<String>;
+   func Edit(var P : LLVM_Printer;
+             I : Int;
+             New_Instrs : ZVector<String>);
+
+   //  Progress to next PSIR instruction
+   func Next_PSIR_Instr(var P : LLVM_Printer);
+
+   //  You should declare all functions you call.
+   //  This will only declare each unique string once
+   //  Example:
+   //  P.Declare("void @Func(i64*, i64*, i64*)")
+   //  Will not declare functions that are defined locally
+   func Declare(var P : LLVM_Printer; D : String)
+
+   //  Note the location of a Begin_Nested_Block_Op to later be split
+   //  into multiple llvm functions
+   func Begin_Nested_Block_Op(var P : LLVM_Printer; I : Code_Index;
+      CBI : Reflection::Code_Block_Info; Is_Internal_Precond : Bool);
+
+   //  Return #true if the PSIR instuction at I is in a Nested Block
+   func In_Nested_Block(P : LLVM_Printer; I : Code_Index) -> Bool;
+
+   //  Return name of block defined at PSIR Instruction I
+   //  if Is_Internal_Precond is #true, I is ignored
+   //  If Callee_Name is not supplied, use the name of the function
+   //  currently being compiled
+   func Get_Block_Name(P : LLVM_Printer; I : Code_Index;
+      Is_Internal_Precond : Bool;
+      Callee_Name : optional String := null) -> String;
+
+   //  Return true iff I is within a Nested Block 
+   //  and that block uses the Storage Region
+   func Block_Uses_Rgn(P : LLVM_Printer; I : Code_Index) -> Bool;
+
+   //  return null if not inside block.
+   //  return the nested level if inside a block
+   func Block_Nested_Level(P : LLVM_Printer; I : Code_Index) -> optional Int;
+
+   //  Add global constant to later be streamed to the top of the file
+   //  Don't include the @" and ". Just use the name
+   func Add_Constant(var P : LLVM_Printer; Name : String;
+      Val : Reflection::Streamable_Value);
+   
+   //  return constant names mapped to stream sizes
+   func Get_Constants(var P : LLVM_Printer) -> Map<String, Int>;
+
+   //  Create stream for anon constant if large, non-string.
+   //  Add stream to Constant_Streams and return length of stream if large.
+   //  Return 0 if small or string.
+   func Create_Anon_Const_Stream(var P : LLVM_Printer;
+      Anon_Const_Name : String;
+      Anon_Const_Val  : Reflection::Streamable_Value) -> Int;
+
+   //  Add module and op names to be output into table
+   //  and reconstructed at run time
+   //  Also record Has_Internal_Precond and Uses_Queuing flags for the func.
+   func Add_Module_Op(var P : LLVM_Printer;
+      Module_Name, Op_Name, LLVM_Name : String;
+      Has_Internal_Precond, Uses_Queuing : Bool);
+
+   //  return the size of the Module_Op_Info map
+   //  equal to the number of unique [LLVM_Name]s passed to Add_Module_Op
+   func Module_Op_Info_Size(P : LLVM_Printer) -> Int;
+
+   //  return the number of local functions that have an internal precondition.
+   //  Those functions have a corresponding block with
+   //  name *_.0internal_precond
+   func Num_Internal_Preconds(P : LLVM_Printer) -> Result : Int;
+
+   //  Only give the name (no type necessary)
+   //  Declare every constant you use.
+   //    Duplicates are thrown out
+   //    if it's defined in this file it won't get declared
+   //    if it's not defined in this file it will get declared
+   //  Name will be be checked against names passed to Add_Constant
+   //  so make sure the string formatting matches
+   //  Example: P.Declare_Const("Math::Pi");
+   func Declare_Const(var P : LLVM_Printer; Name : String);
+
+   //  Declare an anonymous constant; return its index in table of local
+   //  constants.
+   func Decl_Anon_Const(var P : LLVM_Printer;
+     Locator : Reflection::Object_Locator; Info : Reflection::Const_Info)
+     -> Per_File_Constants::Local_Index
+
+   //  Check if a function has been defined in this file with [Name].
+   func Has_Func(P : LLVM_Printer; Name : String) -> Bool;
+
+   //  Set the Source line and column number before each instruction
+   //  For debugging information in the output
+   func Set_Debug(var P : LLVM_Printer; L, C : Int);
+
+   //  Call after last instruction, then you can use |= to add
+   //  code to the top of the file
+   func Begin_Top_Of_File_Initializations(var P : LLVM_Printer);
+end interface PSC::LLVM_Printer;

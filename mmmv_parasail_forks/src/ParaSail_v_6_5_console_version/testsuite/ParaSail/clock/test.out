@@ -1,0 +1,4 @@
+clock.psl:187:5: Error: Queuing used in operation but it is not marked as "queued":
+clock.psl:187:5: Info:   func Delay
+clock.psl:192:5: Error: Queuing used in operation but it is not marked as "queued":
+clock.psl:192:5: Info:   func Delay

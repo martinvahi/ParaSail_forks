@@ -1,0 +1,3351 @@
+import PSC::*, PSL::Short_Names::*
+
+class PSC::Translate is
+   //////////////// TODO //////////////////////////////////////////////////////
+   //  Proved flag
+   //    Precondition on Call_Op and Start/Add_Parallel_Call_Op
+   //    Postcondition on Return
+   //  allow -O and -g together
+   //  Runtime stderr messages
+   //  differentiate between File not found and code-less interfaces
+   ///////////// KNOWN BUGS ///////////////////////////////////////////////////
+   ////////////////////////////////////////////////////////////////////////////
+
+   const Run_Time_Checks : Boolean := #true;
+   const Indent := 3;
+   const Ind := Indent * " ";
+   const Debug_Strings : Boolean := #false;
+   const Use_VN_IL : Boolean := #true;
+   const Virt_Is_Phys : Boolean := #true;
+      // Whether virtual addresses are actually identical to physical addresses
+   
+   const Recon_Value_Func := "i64 @_psc_reconstruct_value";
+
+   //  Copy the constants here for convenience
+   type Code_Index is Reflection::Routine::Code_Index
+
+   const Zero_Base  := Reflection::Object_Locator::Zero_Base;
+   const Local_Area := Reflection::Object_Locator::Local_Area;
+   const Param_Area := Reflection::Object_Locator::Param_Area;
+   const Type_Area  := Reflection::Object_Locator::Type_Area;
+   const Const_Area := Reflection::Object_Locator::Const_Area;
+   const Enclosing_Param_Areas :=
+      Reflection::Object_Locator::Enclosing_Param_Areas;
+   const Enclosing_Local_Areas :=
+      Reflection::Object_Locator::Enclosing_Local_Areas;
+   const Enclosing_Type_Areas :=
+      Reflection::Object_Locator::Enclosing_Type_Areas;
+   const Base_Registers := Reflection::Object_Locator::Base_Registers;
+   const Phys_Base_Registers :=
+      Reflection::Object_Locator::Phys_Base_Registers;
+
+   //  Replace any character in Take with Put
+   func Replace(S : String; Take : Set<Char>; Put : Char) -> String is
+      var V := S.To_Vector();
+      for each Elem of V concurrent loop
+         if Elem in Take then
+            Elem := Put;
+         end if
+      end loop
+      return String::From_Vector(V)
+   end func Replace
+   
+   //  Replace any character in Take with Put
+   //  if not surrounded by Toggle_On characters
+   func Replace_With_Toggle(S : String; Take : Set<Char>;
+      Put, Toggle_On : Char) -> String is
+      var V := S.To_Vector();
+      var Replacing : Bool := #true;
+      for each Elem of V forward loop
+         //  The reason the toggling happens in two places is that
+         //  if Toggle_On is in Take, then we still want to replace
+         //  it on both edges
+
+         if not Replacing and then Elem == Toggle_On then
+            //  Begin replacing
+            Replacing := #true;
+            if Elem in Take then
+               Elem := Put;
+            end if
+         else
+            //  Test condition before we update Replacing
+            //  but make the replacement later because Elem still
+            //  needs to be checked if it equals Toggle_On
+            const Will_Replace := (Replacing and then Elem in Take);
+
+            if Replacing and then Elem == Toggle_On then
+               //  Stop replacing
+               Replacing := #false;
+            end if
+
+            //  Make the replacement
+            if Will_Replace then
+               Elem := Put;
+            end if
+         end if
+      end loop
+      return String::From_Vector(V)
+   end func Replace_With_Toggle
+
+   //  Replace any slice matching Take with Put.
+   //  Overlapping matches will be replaced only once. Example:
+   //    Replace(":::", "::", ".") -> ".:"
+   func Replace(S, Take, Put : String) -> String is
+      const Len_Take := Length(Take);
+      const Len_Put := Length(Put);
+      if Len_Take == 0 then
+         //  No-op
+         return S;
+      elsif Len_Take == 1 and Len_Put == 1 then
+         //  Replace Char with Char
+         return Replace(S, Take[1], Put[1]);
+      elsif Len_Take == 1 and Len_Put != 1 then
+         //  Replace Char with String of any Length
+         var Result : Vector<Char> := [];
+         const Take_Char := Take[1];
+         for I in 1 .. Length(S) forward loop
+            if S[I] == Take_Char then
+               Result |= To_Vector(Put);
+            end if
+         end loop
+         return String::From_Vector(Result);
+      else
+         //  Replace String of Length >= 2 with String of any Length
+         var Result : Vector<Char> := [];
+         const Len_S := Length(S);
+         var I := 1;
+         while I <= Len_S loop
+            if I + Len_Take <= Len_S + 1 and then
+               S[I ..< I + Len_Take] == Take then
+               //  Matches
+               Result |= To_Vector(Put);
+               //  Overlapping matches replaced only once
+               //  Skip past end of this match
+               I += Len_Take;
+            else
+               //  Does not match just add Ith character to Result
+               Result |= S[I];
+               I += 1;
+            end if
+         end loop
+         return String::From_Vector(Result)
+      end if
+   end func Replace
+
+   //  Create a quoted link-name based on full name and prior-homonym count
+   func Make_Link_Name(Name : String; Homonyms : Int := 0) -> String is
+      // Replace '"', '<', or '>' with '$', "::" with '.', and ", " with ".."
+      const To_Cash : Set<Char> := '"' | '<' | '>';
+      var Replaced := Replace_With_Toggle(Name, Take => To_Cash,
+         Put => '$', Toggle_On => '"');
+      Replaced := Replace(Replaced, "::", ".");
+      Replaced := Replace(Replaced, ", ", "..");
+      if Homonyms > 0 then
+         //  Is overloaded; add ".XX" where XX is prior homonym count + 1
+         return '"' | Replaced | '.' | Homonyms+1 | '"';
+      else
+         return '"' | Replaced | '"';
+      end if
+   end func Make_Link_Name
+
+   //  Turn a designator into the corresponding exported built-in function name
+   func Builtin_Name(Desig : String) -> String is
+      if Desig == "#close_output_file" or Desig == "#close_input_file" then
+         return "_psc_close_file";
+      elsif Desig[1] == '#' then
+         return "_psc_" | Desig[1 <.. Length(Desig)];
+      elsif Desig == "\"**\"" then
+         return "_psc_int_exponentiate";
+      elsif Desig == "\"**=\"" then
+         return "_psc_int_assign_exponentiate";
+      else
+         var IO := IO::Get_IO();
+         IO.Stderr.Println("Internal: Can't find builtin for " | Desig);
+         {#false};
+      end if
+   end func Builtin_Name
+
+   //  Construct the link name (including the @) from a Routine
+   func Get_Name(R : Reflection::Routine) -> String is
+      //  Name known at compile time, indirect not necessary
+      var Code_Name := R.Name();
+      const Module_Name := R.Module_Name();
+      if Module_Name not null and then Module_Name != "" then
+         Code_Name := Module_Name | "::" | Code_Name;
+      elsif Code_Name == "main" then
+         //  Special case, calling main recursively
+         Code_Name := "_parasail_main_routine";
+      end if
+
+      //  Convert to linking name
+      const Desig := R.Built_In_Desig()
+      if Desig not null and then Desig != "" then
+         Code_Name := '@' | Make_Link_Name(Builtin_Name(Desig));
+      else
+         const Homonyms := Num_Prior_Homonyms(R);
+         Code_Name := '@' | Make_Link_Name(Code_Name, Homonyms);
+      end if
+      
+      return Code_Name;
+   end func Get_Name
+
+   //  Use the Call Target and Static Link to find the
+   //  Routine and Type_Descriptor for the call
+   //  returns (null, null) if not compile-time known
+   func Routine_And_TDesc_For_Call(
+      Target, Static_Link : Reflection::Object_Locator) ->
+      Pair<optional Reflection::Routine,
+           optional Reflection::Type_Descriptor> is
+      const CT_Base   := Base(Target);
+      const CT_Offset := Offset(Target);
+      const SL_Base   := Base(Static_Link);
+      const SL_Offset := Offset(Static_Link);
+      var Type_Desc_To_Use :
+         optional Reflection::Type_Descriptor := null;
+      var Routine : Reflection::Routine;
+
+      if CT_Base == Zero_Base then
+         Routine := Routine_At_Locator(Target);
+      else
+         //  We can still figure out the routine at compile time if
+         //  the static link is pointing to a compile time known type
+         if SL_Base == Zero_Base and 
+            (CT_Base == Zero_Base or CT_Base == Type_Area) and
+            CT_Offset in
+               Reflection::Object_Locator::Type_Operation_Offsets
+         then
+            //  Dig out the information from the operations table
+            Type_Desc_To_Use :=
+               Type_Desc_At_Locator(Static_Link);
+            const Op_Index := [[CT_Offset - Reflection::Object_Locator::
+               Type_Operation_Offsets.First]];
+            const Info := Operations(Type_Desc_To_Use)[Op_Index]
+
+            if Info.Action != #no_action then
+               //  Actions are handled by an indirect call
+               return (null, null);
+            end if
+
+            if not Info.Use_Static_Link_For_Type then
+               //  Type descriptor
+               Type_Desc_To_Use := Info.Type_Desc;
+            end if
+            Routine := Routine_At_Index(Info.Index);
+         else
+            //  Not Compile-Time known
+            return (null, null);
+         end if
+      end if
+      return (Routine, Type_Desc_To_Use);
+   end func Routine_And_TDesc_For_Call
+
+   func Finalize_If_Needed(var LL : LLVM_Printer;
+                           I : Code_Index; Uses_Rgn : Bool) is
+      //  Finalize region if necessary
+      if (not LL.In_Nested_Block(I) and Uses_Rgn)
+         or LL.Block_Uses_Rgn(I) then
+         const Finalize := "@_psc_finalize_stg_rgn";
+         LL.Declare("void " | Finalize | "(i64*, i64*)");
+         LL |= "call void " | Finalize |
+            "(i64* %_Context, i64* %_Local_Area)";
+      end if
+   end func Finalize_If_Needed
+
+   func Compile_One_Instr(Operation_Routine : Reflection::Routine;
+      var LL : LLVM_Printer; I : Code_Index;
+      var VN_IL : optional PSC::VN_IL_Type;
+      var Look_Ahead_Count : Int) is
+      //  This function compiles one (or more) PSVM instruction(s) to LLVM
+      //  LL is the Printer in use
+      //  LL.PFT is the Per_File_Table for Type Descriptors
+      //  LL.PFS is the Per_File_Table for Strings
+      //  I is the instruction index
+      //  VN_IL is the output from the ParaScope analysis, if any.
+      //  On return, Look_Ahead_Count is the number of additional instructions
+      //  that have already had code generated for them due to lookahead.
+
+      Look_Ahead_Count := 0;  //  By default, no lookahead is performed.
+
+      const Instr := Operation_Routine.Nth_Instr(I);
+      const Uses_Rgn := Operation_Routine.Uses_Stg_Rgn();
+
+      //  Dereferences the static link N times
+      //  Puts code into LL and returns the llvm identifier
+      //  that holds the requested pointer
+      func Follow_Static_Link(N : Int; UID : Int)
+         -> String is
+         //  dereference Static Link N times
+         var Prev := "%_Static_Link";
+         var Ptr  := "%_Static_Link";
+         for J in 0 ..< N forward loop
+            //  uniques for each loop iteration
+            const Ptr_Val := "%_ptr_val" | J | "_" | UID;
+            Ptr           := "%_ptr"     | J | "_" | UID;
+
+            //  Load then cast to pointer
+            LL |= Ptr_Val | " = load i64* " | Prev;
+            LL |= Ptr | " = inttoptr i64 " | Ptr_Val | " to i64*";
+            Prev := Ptr;
+         end loop
+         return Ptr;
+      end func Follow_Static_Link
+
+      //  See below for description
+      func Load_Via_Locator(Locator : Reflection::Object_Locator;
+         Addr, Val : String;
+         Num_Indir : Int := 0;
+         Ptr_Level : Int := 0;
+         UID_Extra : Int := 0);
+
+      //  Get the physical address corresponding to the given locator
+      //  If used multiple times in one PSVM instruction,
+      //    pass unique UID_Extras for each call
+      func Get_Locator_Ptr(Locator : Reflection::Object_Locator;
+         Gets : String;
+         UID_Extra : Int := 0) is
+
+         const UID := I * 10 + UID_Extra;
+
+         const B := Locator.Base()
+         const Off := Offset(Locator);
+         case B of
+            [Zero_Base] =>
+               if Offset(Locator) == 0 then
+                  LL |= Gets | " = getelementptr i64* null, i64 0";
+               else
+                  var IO := IO::Get_IO();
+                  IO.Stderr.Println(
+                     "Internal: Get_Locator_Ptr of non-null Zero_Base");
+                  {#false}
+               end if
+
+            [Local_Area] =>
+               LL |= Gets | " = getelementptr i64* %_Local_Area, i64 " | Off;
+
+            [Param_Area] =>
+               LL |= Gets | " = getelementptr i64* %_Param_Area, i64 " | Off;
+
+            [Const_Area] =>
+               //  Compile time known Constants are streamed 
+               //  and rebuilt like type descriptors and strings
+               const Info :=
+                 Reflection::Const_Info::Const_Info_At_Locator(Locator);
+               var Name := Info.Name;
+               if Name not null and then Name != "" then
+                  //  A named constant
+                  Name := Make_Link_Name(Name);  // This surrounds with "..."
+                  LL.Declare_Const(Name[1 <..< |Name|]); // strip the "..."
+                  Name := '@' | Name;
+               else
+                  //  An anonymous constant
+                  const Const_Index :=
+                    LL.Decl_Anon_Const(Locator, Info);
+                  Name := "@$Anon_Const_" | Const_Index
+               end if;
+               LL |= Gets | " = getelementptr i64* " | Name | ", i64 0";
+
+            [Enclosing_Param_Areas.First .. Enclosing_Param_Areas.Last] =>
+               //  dereference Static Link (Base - First - 1) times
+               //  then follow 1st ptr to param area
+               const Encl_Param_Ptr    := "%_encl_param_ptr"    | UID;
+               const Encl_Param        := "%_encl_param"        | UID;
+               const Encl_Param_As_Ptr := "%_encl_param_as_ptr" | UID;
+               const Num_Derefs := B - 1 - Enclosing_Param_Areas.First;
+               const Ptr := Follow_Static_Link(Num_Derefs, UID);
+               LL |= Encl_Param_Ptr | " = getelementptr i64* " |
+                   Ptr | ", i64 1";
+               LL |= Encl_Param | " = load i64* " | Encl_Param_Ptr;
+               LL |= Encl_Param_As_Ptr | " = inttoptr i64 " | Encl_Param |
+                   " to i64*";
+               LL |= Gets | " = getelementptr i64* " | Encl_Param_As_Ptr |
+                   ", i64 " | Off;
+
+            [Enclosing_Local_Areas.First .. Enclosing_Local_Areas.Last] => 
+               //  dereference the static link (Base - First - 1) times
+               const Ptr := Follow_Static_Link(B - 1 -
+                  Enclosing_Local_Areas.First, UID);
+               LL |= Gets | " = getelementptr i64* " | Ptr | ", i64 " | Off;
+
+            [Enclosing_Type_Areas.First .. Enclosing_Type_Areas.Last |
+             Type_Area] =>
+               //  Get type descriptor if the static link isn't
+               const Block_Level := LL.Block_Nested_Level(I);
+               const Nested_Level := Block_Level not null?
+                  Block_Level : Operation_Routine.Nesting_Level();
+               const TDesc := Follow_Static_Link(Nested_Level, UID);
+
+               //  call out-of-line to get address
+               const Nth := "i64* @_psc_nth_type_area_item_physical_address";
+               LL.Declare(Nth | "(i64*, i16, i16)");
+               LL |= Gets | " = call " | Nth | "(i64* " | TDesc |
+                  ", i16 " | Off | ", i16 " | B | ")";
+            
+            [Base_Registers.First .. Base_Registers.Last |
+             Phys_Base_Registers.First .. Phys_Base_Registers.Last] => 
+               //  Base registers store a virtual address in the local area
+               //  Phys do the same thing but with a physical address
+               const Reg_Ptr_Ptr := "%_reg_ptr_ptr" | UID;
+               const Reg_Ptr     := "%_reg_ptr"     | UID;
+               const Reg         := "%_reg"         | UID;
+               const V_Reg       := "%_v_reg"       | UID;
+               const Reg_Index : Reflection::Offset_Within_Area :=
+                                   [[B in Base_Registers?
+                                      (B - Base_Registers.First) :
+                                      (B - Phys_Base_Registers.First)]];
+               if Virt_Is_Phys or else B in Phys_Base_Registers then
+                  const Local_Loc : Reflection::Object_Locator :=
+                    Create (Base => Local_Area, Offset => Reg_Index)
+                  Load_Via_Locator
+                    (Locator => Local_Loc,
+                     Addr => Reg_Ptr, Val => Reg,
+                     Ptr_Level => 1, UID_Extra => UID*10 + 1)
+               else
+                  LL |= Reg_Ptr | " = getelementptr i64* %_Local_Area, i64 " | 
+                     Reg_Index;
+                  LL |= Reg_Ptr_Ptr |
+                         " = bitcast i64* " | Reg_Ptr | " to i64**";
+                  LL |= V_Reg | " = load i64** " | Reg_Ptr_Ptr;
+                  const Convert := "i64* @_psc_large_obj_addr";
+                  LL.Declare(Convert | "(i64*)");
+                  LL |= Reg | " = call " | Convert | "(i64* " |
+                     V_Reg | ")";
+               end if
+               LL |= Gets | " = getelementptr i64* " | Reg | ", i64 " | Off;
+
+            [..] =>
+               var IO := IO::Get_IO();
+               IO.Stderr.Println("Error: Internal: Bad locator base = " | B);
+               {#false}
+         end case;
+      end func Get_Locator_Ptr
+
+      //  Load from the physical address corresponding to the given locator
+      //  Result is in Val register.  Address (after extra indirs) is in Addr.
+      //  if Num_Indir > 0, then perform that many levels of indirection.
+      //  if Ptr_Level > 0, then result should be a pointer rather than an int,
+      //    of type "i64*" for Ptr_Level == 1, "i64**" for Ptr_Level == 2, etc.
+      //  If Get_Locator_Ptr, Load_Via_Locator, or Store_Via_Locator are
+      //    used multiple times in one PSVM instruction,
+      //    pass unique UID_Extras for each call
+      func Load_Via_Locator(Locator : Reflection::Object_Locator;
+         Addr, Val : String;
+         Num_Indir : Int := 0;
+         Ptr_Level : Int := 0;
+         UID_Extra : Int := 0) is
+
+         var Ptrs := Num_Indir + Ptr_Level;
+        
+         const VN := VN_IL is null? null:
+                       VN_IL.Contents_Of_Locator
+                         (I, Locator, Addr,
+                          Num_Indir => Num_Indir,
+                          Ptr_Level => Ptr_Level);
+
+         if VN not null and then VN_IL.VN_Is_Inited (VN, I) then 
+            //  Load from specified value number
+            //  Addr will be remembered internally for next call on Store_Indir
+            const VN_Name := VN_IL.VN_Name (VN, I);
+
+            if VN_IL.VN_Is_Parallel_Output (VN, I) then
+               //  We deferred loading the VN because the operation was
+               //  performed in parallel.
+               //  Load it now.
+               LL |= VN_Name | " = load i64* " |
+                 VN_IL.VN_Parallel_Output_Addr (VN, I);
+
+               //  Now remember that VN has been loaded
+               VN_IL.VN_Inited_Here (VN, I);
+            end if
+
+            if Ptr_Level > 0 then
+               //  one or more pointer levels wanted
+               const Type_Sig := "i64" | Ptr_Level * "*";
+
+               LL |= Val | " = inttoptr i64 " | VN_Name | " to " | Type_Sig;
+            else
+               //  i64 wanted
+               LL |= Val | " = bitcast i64 " | VN_Name | " to i64";
+            end if
+
+         elsif Ptrs == 0 then
+            //  Simple case, just load an i64
+            Get_Locator_Ptr(Locator, Addr, UID_Extra);
+            LL |= Val | " = load i64* " | Addr;
+
+         else
+            //  We want to return an object of type "i64" | Ptrs * "*"
+            //  Recurse to load all but last level
+            const Type_Sig := "i64" | (Ptr_Level+1) * "*";
+            if Num_Indir > 0 then
+               Load_Via_Locator(Locator, Addr | "X", Addr,
+                 Num_Indir-1, Ptr_Level+1, UID_Extra*10+1)
+            else
+               const Addr_Orig := Addr | "_Orig"
+               Get_Locator_Ptr(Locator, Addr_Orig, UID_Extra);
+               //  Convert result of Get_Locator_Ptr to proper type
+               LL |= Addr | " = bitcast i64* " |
+                 Addr_Orig | " to " | Type_Sig;
+            end if
+
+            //  Last load is into "Val" from "Addr"
+            LL |= Val | " = load " | Type_Sig | " " | Addr;
+         end if
+
+         if VN not null and then not VN_IL.VN_Is_Inited (VN, I) then
+            //  Copy value into VN for later use
+
+            const VN_Name := VN_IL.VN_Name(VN, I)
+
+            if Ptr_Level > 0 then
+               //  one or more pointer levels wanted
+               const Type_Sig := "i64" | Ptr_Level * "*";
+
+               LL |= VN_Name | " = ptrtoint " | Type_Sig | " " | Val |
+                             " to i64";
+            else
+               //  i64 wanted
+               LL |= VN_Name | " = bitcast i64 " | Val | " to i64";
+            end if
+
+            //  Remember that VN now has been initialized
+            VN_IL.VN_Inited_Here (VN, I);
+
+            if Debug and then
+              Num_Indir == 0
+              and then Base(Locator) == Reflection::Object_Locator::Local_Area
+            then
+               var IO := IO::Get_IO();
+               IO.Stderr.Println(
+                  Instr.Source_Pos() | 
+                  " Internal: Attempted to load from Local_Area, offset " |
+                  Offset(Locator) | ", " | VN_IL.VN_Name(VN, I))
+            end if
+         end if
+      end func Load_Via_Locator
+
+      //  Store into the physical address corresponding to the given locator
+      //  If Ptr_Level > 0, then Val is presumed to be of
+      //    type i64 | Ptr_Level*"*", and Addr needs to be bitcast to
+      //    one more level of pointer after calling Get_Locator_Ptr.
+      //  If Get_Locator_Ptr, Load_Via_Locator, or Store_Via_Locator are
+      //    used multiple times in one PSVM instruction,
+      //    pass unique UID_Extras for each call
+      //  Instr_Look_Ahead is used when we are looking ahead at a later instr
+      func Store_Via_Locator(Locator : Reflection::Object_Locator;
+         Addr, Val : String;
+         Ptr_Level : Int := 0;
+         UID_Extra : Int := 0;
+         Instr_Look_Ahead : Int := 0) is
+
+         const Inst := I + Instr_Look_Ahead;  // Adjusted index
+         const VN := VN_IL is null? null:
+                       VN_IL.Target_For_Store
+                         (Inst, Locator,
+                          Ptr_Level => Ptr_Level);
+         const Value_Held_In_VN := VN is null? #false :
+           Base(Locator) == Reflection::Object_Locator::Local_Area;
+
+         if VN not null and then not VN_IL.VN_Is_Inited (VN, Inst) then
+            //  Copy Val into VN if not yet initialized
+            //  Need to use a no-op operation
+            const VN_Name := VN_IL.VN_Name(VN, Inst)
+
+            if Ptr_Level > 0 then
+               //  one or more pointer levels wanted
+               const Type_Sig := "i64" | Ptr_Level * "*";
+
+               LL |= VN_Name | " = ptrtoint " | Type_Sig | " " | Val |
+                             " to i64";
+            else
+               //  i64 wanted
+               LL |= VN_Name | " = bitcast i64 " | Val | " to i64";
+            end if
+
+            //  Remember that VN has been initialized
+            VN_IL.VN_Inited_Here(VN, Inst);
+
+         end if
+
+         
+         if Value_Held_In_VN then
+            //  No need to store into local area if we have a VN.
+            //  Remember that value not yet stored into locator
+            VN_IL.Value_Only_In_VN(VN, Inst, Locator);
+
+         elsif Ptr_Level == 0 then
+            //  Simple case, just store (we have already excluded locals that
+            //  can live in a VN).
+            Get_Locator_Ptr(Locator, Addr, UID_Extra);
+            LL |= "store i64 " | Val | ", i64* " | Addr;
+         else
+            //  Bitcast Addr to proper type and then store Val.
+            Get_Locator_Ptr(Locator, Addr | "_Orig", UID_Extra);
+            const Type_Sig := "i64" | Ptr_Level * "*"
+            LL |= Addr | " = bitcast i64* " | Addr | "_Orig to " |
+                   Type_Sig | "*";
+            LL |= "store " | Type_Sig | " " | Val | ", " |
+                    Type_Sig | "* " | Addr;
+         end if
+      end func Store_Via_Locator
+
+      //  Store Val at address Addr, presuming Val is i64, Addr is i64*
+      func Store_Indir(Addr, Val : String) is
+         const VN := VN_IL is null? null: VN_IL.Target_For_Store_Indir (Addr);
+
+         if VN not null and then VN_IL.VN_Is_Inited (VN, I) then
+            //  Copy Val into VN
+            //  TBD: Handle case where prior init of VN doesn't dominate
+            //       this location.
+            LL |= VN_IL.VN_Name (VN, I) | " = bitcast i64 " | Val | " to i64";
+
+            //  Remember that we have init'ed this VN
+            VN_IL.VN_Inited_Here (VN, I);
+         end if
+         
+         //  Always Store into Addr as well
+         LL |= "store i64 " | Val | ", i64* " | Addr;
+      end func Store_Indir
+
+      func Copy_Word(Source, Target : Reflection::Object_Locator) is
+         //  unique local variable names
+         const SourceID := "%_source" | I;
+         const Source_ValID := "%_source_val" | I;
+         const DestID := "%_dest" | I;
+
+         //  Read the value at the source
+         Load_Via_Locator
+           (Source, SourceID, Source_ValID, UID_Extra => 1);
+
+         //  Store the source value into the destination
+         Store_Via_Locator
+           (Target, DestID, Source_ValID, UID_Extra => 2);
+      end func Copy_Word
+
+      func Get_Type_Desc(Loc : Reflection::Object_Locator;
+         Gets : String;
+         TDesc_To_Use : optional Reflection::Type_Descriptor := null;
+         UID_Extra : Int := 0) is
+         //  Place a pointer to the type descriptor at Loc
+         //  in the LLVM identifier Gets
+         const Block_Level := LL.Block_Nested_Level(I);
+         const Nested_Level := Block_Level not null?
+            Block_Level : Operation_Routine.Nesting_Level();
+
+         const UID := I * 10 + UID_Extra;
+
+         if Base(Loc) == Zero_Base and Offset(Loc) == 0 then
+            LL |= Gets | " = getelementptr i64* null, i64 0";
+         elsif Base(Loc) == Type_Area and Offset(Loc) == 0 then
+            //  Not statically known
+            const TDesc := Follow_Static_Link(Nested_Level, UID);
+            //  Copy pointer to Type Descriptor into Gets
+            LL |= Gets | " = getelementptr i64* " | TDesc | ", i64 0";
+         elsif Base(Loc) == Zero_Base then
+            //  Statically known
+            const Desc_Ptr_Ptr := "%_desc_ptr_ptr" | UID;
+            const Desc_Ptr     := "%_desc_ptr"     | UID;
+            const TDesc := TDesc_To_Use not null? TDesc_To_Use :
+               Reflection::Type_Descriptor::Type_Desc_At_Locator(Loc);
+            const Type_Index := LL.PFT.Get_Local_Index(TDesc);
+            //  Index into streamed type descriptors
+            LL |= Desc_Ptr_Ptr | " = load i64*** @$Types";
+            LL |= Desc_Ptr | " = getelementptr i64** " | 
+               Desc_Ptr_Ptr | ", i64 " | Type_Index-1;
+            LL |= Gets | " = load i64** " | Desc_Ptr;
+         else
+            //  Go out of line to get type descriptor or op map
+            LL.Declare("i64* @_psc_get_type_desc_or_op_map" |
+               "(i64*, i16, i16)");
+            LL |= Gets | " = call i64* @_psc_get_type_desc_or_op_map" |
+               "(i64* " | Follow_Static_Link(Nested_Level, UID) |
+               ", i16 " | Base(Loc) | ", i16 " | Offset(Loc) | ")";
+         end if
+      end func Get_Type_Desc
+
+      func Get_Null(Loc : Reflection::Object_Locator; Gets : String) is
+         //  Put Null for this type into the llvm identifier Gets
+         const Desc := "%_desc" | I;
+         Get_Type_Desc(Loc, Desc);
+         LL.Declare("i64 @_psc_local_null(i64*, i64*)");
+         LL |= Gets | " = call i64 @_psc_local_null(i64* %_Context, i64* " 
+            | Desc | ")";
+      end func Get_Null
+
+      func Get_Recon_String_Id(Str, Gets : String) is
+         //  Place a reconstructed univ string id
+         //  in the LLVM identifier Gets
+         const Str_Ptr_Ptr := "%_str_ptr_ptr" | I;
+         const Str_Ptr     := "%_str_ptr"     | I;
+         const Orig_Num_Strs    := LL.PFS.Num_Elems();
+         const Str_Index := LL.PFS.Get_Local_Index(Str);
+         if Debug_Strings and then LL.PFS.Num_Elems() > Orig_Num_Strs then
+            Println("Get_Recon_String_Id: #" | Str_Index | " is " | Str);
+         end if;
+
+         LL |= Str_Ptr_Ptr | " = load i64** @$Strings";
+         LL |= Str_Ptr | " = getelementptr i64* " | 
+            Str_Ptr_Ptr | ", i64 " | Str_Index-1;
+         LL |= Gets | " = load i64* " | Str_Ptr;
+      end func Get_Recon_String_Id
+
+      func Check_Is_Null(Type_Loc : Reflection::Object_Locator;
+                    For_Not_Null : Bool := #false) is
+         //  Check whether is null
+         //  For_Not_Null is #false for Is_Null, is #true for Is_Not_Null
+         //  Used by #Is_Null_Op and #Not_Null_Op
+         const Arg        := "%_arg"        | I;
+         const Arg_Ptr    := "%_arg_ptr"    | I;
+         const Result     := "%_result"     | I;
+         const Result_Ext := "%_result_ext" | I;
+         const Result_Ptr := "%_result_ptr" | I;
+         const Desc       := "%_desc"       | I;
+         Load_Via_Locator(Instr.Source(), Arg_Ptr, Arg, UID_Extra => 1);
+         Get_Type_Desc(Type_Loc, Desc);
+         LL.Declare("i1 @_psc_is_null_value(i64, i64*)");
+         LL |= Result | " = call i1 @_psc_is_null_value(i64 " | Arg
+            | ", i64* " | Desc | ")";
+         if For_Not_Null then
+            //  Need to complement the result
+            const Complement := "%_cmplmt" | I;
+            LL |= Complement | " = icmp eq i1 " | Result | ", 0";
+            LL |= Result_Ext | " = zext i1 " | Complement | " to i64";
+         else
+            //  Result of is_null_value can be used directly
+            LL |= Result_Ext | " = zext i1 " | Result | " to i64";
+         end if
+         Store_Via_Locator
+           (Instr.Destination(), Result_Ptr, Result_Ext, UID_Extra => 2);
+      end func Check_Is_Null
+
+      func Continue_If_Level_Diff_Zero(Level_Skip : String) is
+         //  if Level_Diff != 0 then this function returns as well
+         //  with (Level_Diff - 1, Skip_Count) to caller
+         //  else Skip
+         const Level_Diff32         := "%_level_diff32_"        | I;
+         const Level_Diff           := "%_level_diff"           | I;
+         const Level_Diff_NZ        := "%_level_diff_nz"        | I;
+         const Level_Diff_Minus_One := "%_level_diff_minus_one" | I;
+         const Skip_Count           := "%_skip_count"           | I;
+
+         //  Label for executing skips
+         const Switch               := "_switch"                | I;
+
+         //  Get top 16 bits
+         //  Arithmetic vs logical shift makes no difference
+         LL |= Level_Diff32 | " = ashr i32 " | Level_Skip | ", 16";
+         //  Becuase we then truncate
+         LL |= Level_Diff | " = trunc i32 " | Level_Diff32 | " to i16";
+
+         //  Skip_Count is bottom 16 bits
+         LL |= Skip_Count | " = trunc i32 " | Level_Skip | " to i16";
+
+         //  Compare against zero
+         LL |= Level_Diff_NZ | " = icmp ne i16 " |
+            Level_Diff | ", 0";
+
+         //  Exit if Level_Diff != 0
+         const Exit := "_exit" | I;
+         LL |= "br i1 " | Level_Diff_NZ | ", label %" | Exit |  //  True
+                                          ", label %" | Switch; //  False
+         LL |= Exit | ":";
+
+         Finalize_If_Needed(LL, I, Uses_Rgn);
+
+         //  Return correct respective types for
+         //  blocks and for regular functions
+         if LL.In_Nested_Block(I) then
+            const Result     := "%_levelm1_skip" | I;
+            const LD_Zext    := "%_ld_zext"      | I;
+            const LD_Shifted := "%_ld_shifted"   | I;
+            const Skip_Zext  := "%_skip_zext"    | I;
+            LL |= Level_Diff_Minus_One | " = sub nsw i16 " |
+               Level_Diff | ", 1";
+            LL |= LD_Zext | " = zext i16 " | Level_Diff_Minus_One | " to i32";
+            LL |= LD_Shifted | " = shl i32 " | LD_Zext | ", 16";
+            LL |= Skip_Zext | " = zext i16 " | Skip_Count | " to i32";
+            LL |= Result | " = or i32 " | LD_Shifted | ", " | Skip_Zext;
+            LL |= "ret i32 " | Result;
+         else
+            LL |= "ret void";
+         end if
+
+         //  Level diff not zero --> Skip (possibly 0) instructions
+         LL |= Switch | ":";
+         const Default := LL.Add_Label(0);
+         const Skip_Counts := Instr.Skip_Counts();
+         if Skip_Counts not null and then Length(Skip_Counts) > 0 then
+            var Switch_Statement := "switch i16 " | Skip_Count | ", label " |
+               Default | " [\n";
+            for each Skip of Skip_Counts forward loop
+               const Lbl := LL.Add_Label(Skip);
+               Switch_Statement |= (2 * Ind) | "i16 " | Skip |
+                  ", label " | Lbl | "\n";
+            end loop
+            Switch_Statement |= Ind | "]\n";
+            LL |= Switch_Statement;
+         else
+            LL |= "br label " | Default;
+         end if
+      end func Continue_If_Level_Diff_Zero
+
+      //  Generate code to print Msg at run time
+      //  TODO: stdout, stderr
+      func Runtime_Message(Msg : String) is
+         const Assert_Str      := "%_assert_str"     | I;
+         const Print_Param     := "%_print_param"    | I;
+         Get_Recon_String_Id(Msg, Assert_Str);
+         LL.Declare("void @\"_psc_runtime_message\"(i64*, i64*, i64*)");
+         LL |= Print_Param | " = alloca i64";
+         LL |= "store i64 " | Assert_Str | ", i64* " | Print_Param;
+         LL |= "call void @_psc_runtime_message(i64* %_Context, i64* " | 
+            Print_Param | ", i64* null)";
+      end func Runtime_Message
+
+      func Setup_Params_For_Call
+        (Reflection::Routine;
+         Call_Param_Area : String;
+         Is_Parallel : Boolean := #false;
+         UID_Extra : Int := 0) is
+         //  This function loads up the parameter list before the call
+
+         const Params := Routine is null? null : Parameters(Routine);
+         const Param_Loc := Is_Parallel?
+                              Instr.Parallel_Control() : Instr.Params();
+
+         if VN_IL is null or else Params is null then
+            //  Parameters are on the stack at specified offset
+            Get_Locator_Ptr(Param_Loc, Call_Param_Area,
+               UID_Extra => UID_Extra);
+         else
+            //  Parameters are (potentially) stored in LLVM registers
+            //  Use "alloca" to allocate space for parameters, and
+            //  then assign values from Call_Param_Area into the newly
+            //  allocated space.
+            //  NOTE: 0th parameter might not be initialized, so only
+            //        want to copy it if is initialized.
+            //  NOTE2: After call, need to copy value from 0th parameter
+            //        slot back into proper place in "stack"
+
+            const Copy_Outputs := Instr.Output_Inited_Null()
+
+            const Param_Base := Is_Parallel? Reflection::Tcb_Size: 0
+
+            //  Allocate new parameter area
+            LL |= Call_Param_Area | " = alloca i64, i64 " |
+              (Param_Base + |Params|)
+
+            //  Copy the inputs (and perhaps outputs as well) into the 
+            //  newly allocated parameter area.
+            for each [J => P] of Params
+             {Copy_Outputs or else not P.Is_Operation_Output}
+              forward loop
+               const Par_Offs := Param_Base + J-1
+               const Orig_Arg := "%_orig_arg" | I | "_" | Par_Offs
+               const Orig_Arg_Addr := "%_arg_addr" | I | "_" | Par_Offs
+               const New_Arg_Addr :=
+                 "%_new_arg_addr" | I | "_" | Par_Offs
+               Load_Via_Locator (Param_Loc + Par_Offs,
+                 Orig_Arg_Addr, Orig_Arg)
+               LL |= New_Arg_Addr | " = getelementptr i64* " |
+                 Call_Param_Area | ", i64 " | Par_Offs
+               Store_Indir (New_Arg_Addr, Orig_Arg)
+            end loop
+
+         end if
+
+      end func Setup_Params_For_Call
+
+      func Finish_Params_After_Call
+        (Reflection::Routine;
+         Call_Param_Area : String;
+         Is_Parallel : Boolean := #false) is
+         //  This function moves the result to where it is expected,
+         //  after the call
+
+         const Params := Routine is null? null : Parameters(Routine)
+         const Param_Loc := Is_Parallel?
+                              Instr.Parallel_Control() : Instr.Params();
+
+         if VN_IL is null or else Params is null then
+            //  Out parameter is on stack where expected
+            null
+         else
+            //  After call, need to copy value from 0th parameter
+            //  slot back into proper place in "stack"
+
+            const Param_Base := Is_Parallel? Reflection::Tcb_Size: 0
+
+            //  Look at outputs
+            for each [J => P] of Params {P.Is_Operation_Output}
+              forward loop
+               const Par_Offs := Param_Base + J-1
+               const Orig_Result_Addr :=
+                 "%_result_addr" | I | "_" | Par_Offs
+               const New_Result := "%_new_result" | I | "_" | Par_Offs
+               const New_Result_Addr :=
+                 "%_new_result_addr" | I | "_" | Par_Offs
+               LL |= New_Result_Addr | " = getelementptr i64* " |
+                 Call_Param_Area | ", i64 " | Par_Offs
+               //  TBD: Load_Indir (New_Result_Addr, New_Result)
+
+               const Par_VN : optional VN_IL_Type::VN_Id :=
+                    Is_Parallel? 
+                       VN_IL.Target_For_Store
+                         (I, Param_Loc + Par_Offs) : null
+
+               if Par_VN not null then
+                  //  A parallel call, we must defer the load until value
+                  //  actually needed.
+                  VN_IL.VN_Inited_Here(Par_VN, I,
+                    Parallel_Output_Addr => New_Result_Addr)
+               else
+                  //  Not parallel, do the load now
+                  LL |= New_Result | " = load i64* " | New_Result_Addr 
+                  Store_Via_Locator (Param_Loc + Par_Offs,
+                    Orig_Result_Addr, New_Result)
+               end if
+            end loop
+         end if
+
+      end func Finish_Params_After_Call
+
+      func Flush_VNs_If_Necessary(B_Or_A : VN_IL_Type::Before_Or_After) is
+         //  Check if we need to flush VNs to memory before/after this instr
+
+         if VN_IL not null then
+            //  Check if we need to flush some VNs to memory before this instr
+            const VNs_To_Flush := VN_IL.Map_Of_VNs_To_Flush(I, B_Or_A);
+
+            if not Is_Empty(VNs_To_Flush) then
+               //  This or next instruction might need some VNs in memory.
+               //  Iterate over the Locators whose value is held in a VN
+               //  and update them now if necessary.
+               const Suffix := B_Or_A == #before? "before" : "after"
+
+               for each [Locator => VN] of VNs_To_Flush loop
+                  //  Need to update memory cell from VN holding its value
+                  const Flush_Addr :=
+                    "%_flush_" | Suffix | I | "_" | Offset(Locator)
+                  Get_Locator_Ptr(Locator, Flush_Addr);
+                  LL |= "store i64 " | VN_IL.VN_Name (VN, I) |
+                    ", i64* " | Flush_Addr;
+               end loop
+
+               VN_IL.VNs_Flushed_Here(I, VNs_To_Flush);
+            end if
+         end if
+      end func Flush_VNs_If_Necessary
+
+      //  If "-g" is supplied, set the current line and column for the
+      //  debugging information.
+      //  Not for Begin_Nested_Block_Op though because that just ends up being
+      //  a new function
+      const Source_Pos := Source_Pos(Instr);
+      if LL.Debug and then Opcode(Instr) != #Begin_Nested_Block_Op then
+         LL.Set_Debug(Source_Pos.Line(), Source_Pos.Col());
+      end if
+
+      //  llvm comments to help the debugging process
+      //  Not gdb/dwarf debug information, just comments
+      LL |= "; " | To_String(Opcode(Instr)) | " at " |
+         Source_Pos.Line() | ":" | Source_Pos.Col();
+
+      if VN_IL not null then
+         Flush_VNs_If_Necessary(#before)
+      end if
+
+      case Opcode(Instr) of
+         [#Skip_Op] =>
+            //  Skip_Count is in units of PSVM instructions
+            const To : String := LL.Add_Label(Instr.Skip_Count());
+            LL |= "br label " | To;
+         [#Call_Op] =>
+            //  TODO: Precondition proved
+
+            const Static_Link := Instr.Static_Link();
+            const Call_Target := Instr.Call_Target();
+            const SL_Base   := Base(Static_Link);
+            const CT_Base   := Base(Call_Target);
+            const SL_Offset := Offset(Static_Link);
+            const CT_Offset := Offset(Call_Target);
+            const Locked_Param_Info := Instr.Locked_Param_Info();
+            const Targ_Index := Instr.Target_Index();
+
+            const Routine_TDesc := Routine_And_TDesc_For_Call
+               (Instr.Call_Target(), Static_Link);
+            const Routine_To_Call := Routine_TDesc.First;
+            const Routine := Routine_To_Call not null?
+                              Routine_To_Call :
+                             Targ_Index != 0?
+                              Routine_At_Index(Instr.Target_Index()) : null;
+            const Type_Desc_To_Use := Routine_TDesc.Second;
+
+            //  This function makes an indirect call
+            func Indirect() is
+               //  Not known at compile time
+               const Call_Static_Link := "%_call" | I | "_Static_Link";
+               const Call_Param_Area  := "%_call" | I | "_Param_Area";
+               //  0 is Null_Object_Virtual_Address
+               //  Should pass null if we're not calling through an Op_Desc
+               var Op_Desc := "0";
+
+               if SL_Base == Zero_Base or SL_Base == Type_Area or
+                  SL_Base in Enclosing_Type_Areas then
+                  Get_Type_Desc(Instr.Static_Link(), Call_Static_Link);
+               else
+                  Get_Locator_Ptr(Instr.Static_Link(), Call_Static_Link);
+               end if
+
+               Setup_Params_For_Call(Routine, Call_Param_Area, UID_Extra => 1);
+               
+               const Func_Type := "void(i64*, i64*, i64*)*";
+               const Need_Ada :
+                  Set<Reflection::Object_Locator::Area_Base_Indicator> :=
+                  [Zero_Base, Type_Area, Const_Area] // Enclosing_Type_Areas
+               if CT_Base not in Need_Ada and
+                  CT_Base not in Enclosing_Type_Areas
+               then
+                  //  Calling through an Operation_Descriptor
+                  const Op_Desc_Ptr := "%_op_desc_ptr" | I;
+                  Op_Desc           := "%_op_desc"     | I;
+                  Load_Via_Locator
+                    (Call_Target, Op_Desc_Ptr, Op_Desc, UID_Extra => 2);
+                  //  Op_Desc is a object virtual address
+               end if
+               const Execute := "void @_psc_execute_compiled_indirect_call_op";
+               LL.Declare(Execute |
+                  "(i64*, i64*, i64*, i16, i16, " |
+                  "i16, i16, i64, void(i64*, i64*, i64*)*, i8)");
+               LL |= "call " | Execute | "(i64* %_Context, i64* " |
+                  Call_Param_Area | ", i64* " | Call_Static_Link |
+                  ", i16 " | SL_Base | ", i16 " | SL_Offset |
+                  ", i16 " | CT_Base | ", i16 " | CT_Offset |
+                  ", i64 " | Op_Desc |
+                  ", " | Func_Type | " null" | ", i8 " |
+                  Locked_Param_Info | ")";
+
+               Finish_Params_After_Call(Routine, Call_Param_Area)
+
+            end func Indirect
+
+            if Routine_To_Call is null then
+               Indirect();
+
+               //  Return from caller as well so, 
+               //  don't forget to tell the printer
+               LL.Next_PSIR_Instr();
+               return;
+            end if
+
+            const Desig := Routine.Built_In_Desig();
+            //  Some subset of the built-ins can be implemented
+            //  Directly in llvm, if not able, just call it
+
+            func Call() is
+
+               if Desig is null and then Num_Instrs(Routine) == 0 then
+                  //  Presume this is an "optional" routine
+                  //  that has no definition, so it is treated
+                  //  as a no-op.
+                  //  We will have already initialized the output(s), if any,
+                  //  to null.
+                  LL |= "; No-Op: optional routine with no definition";
+                  return;
+               end if;
+
+               const Name : String := Get_Name(Routine);
+
+               //  Declare the func, in case it might be external
+               //  LL keeps track of locally defined functions. They won't
+               //  actually get declared
+               LL.Declare("void " | Name | "(i64*, i64*, i64*)");
+
+               //  Get Static_Link and Param_Area addresses for this call
+               const Call_Static_Link := "%_call" | I | "_Static_Link";
+               const Call_Param_Area  := "%_call" | I | "_Param_Area";
+               if SL_Base == Zero_Base or SL_Base == Type_Area or
+                  SL_Base in Enclosing_Type_Areas then
+                  Get_Type_Desc(Instr.Static_Link(), Call_Static_Link,
+                     Type_Desc_To_Use);
+               else
+                  Get_Locator_Ptr(Instr.Static_Link(), Call_Static_Link,
+                     UID_Extra => 1);
+               end if
+               Setup_Params_For_Call(Routine, Call_Param_Area, UID_Extra => 2);
+
+               if Locked_Param_Info > 0 then
+                  //  Call indirectly but with a pointer to the function
+                  //  Because it needs a lock
+                  const Execute :=
+                     "void @_psc_execute_compiled_indirect_call_op";
+                  LL.Declare(Execute |
+                     "(i64*, i64*, i64*, i16, i16, " |
+                     "i16, i16, i64, void(i64*, i64*, i64*)*, i8)");
+
+                  LL |= "call " | Execute | "(i64* %_Context, i64* " |
+                     Call_Param_Area | ", i64* " | Call_Static_Link |
+                     ", i16 " | SL_Base | ", i16 " | SL_Offset |
+                     ", i16 " | CT_Base | ", i16 " | CT_Offset |
+                     ", i64 0" |
+                     ", void(i64*, i64*, i64*)* " | Name |
+                     ", i8 " | Locked_Param_Info | ")";
+                  Finish_Params_After_Call (Routine, Call_Param_Area);
+                  return;
+               end if
+
+               LL |= "call void " | Name | "(i64* %_Context, i64* " |
+                     Call_Param_Area | ", i64* " | Call_Static_Link | ")";
+               Finish_Params_After_Call (Routine, Call_Param_Area);
+            end func Call
+
+            func Binary_Op(Name : String;
+                           Type : String := "i64";
+                           Cast_Arg2 : String := "bitcast") is
+               {|Parameters(Routine)| == 3}
+               //  Name llvm identifiers
+               const Arg1_Ptr   := "%_first_ptr" | I;
+               const Arg1       := "%_first_arg" | I;
+               const Arg2_Ptr   := "%_secon_ptr" | I;
+               const Arg2       := "%_secon_arg" | I;
+               const Result     := "%_resul"     | I;
+               const Result_Ptr := "%_resul_ptr" | I;
+
+               //  get arguments
+               Load_Via_Locator
+                 (Instr.Params() + 1, Arg1_Ptr, Arg1, UID_Extra => 3);
+               Load_Via_Locator
+                 (Instr.Params() + 2, Arg2_Ptr, Arg2, UID_Extra => 4);
+
+               //  perform operation with correct type
+               if Type != "i64" then
+                  const Arg1c := Arg1 | "c";
+                  const Arg2c := Arg2 | "c";
+                  const Resultc := Result | "c";
+                  //  cast to Type
+                  LL |= Arg1c | " = bitcast i64 " |
+                        Arg1 | " to " | Type;
+                  LL |= Arg2c | " = " | Cast_Arg2 | " i64 " |
+                        Arg2 | " to " | Type;
+
+                  //  perform operation in that type
+                  LL |= Resultc | " = " | Name | " " | Type | " " 
+                        | Arg1c | ", " | Arg2c;
+
+                  //  cast back to i64
+                  LL |= Result | " = bitcast " | Type | " " |
+                        Resultc | " to i64"
+               else  
+                  //  No need to cast
+                  LL |= Result | " = " | Name | " i64 " 
+                        | Arg1 | ", " | Arg2;
+               end if
+
+               //  Store result
+               Store_Via_Locator
+                 (Instr.Params(), Result_Ptr, Result, UID_Extra => 5);
+            end func Binary_Op
+
+            func Assign_Binary_Op(Name : String;
+                        Type : String := "i64") is
+               //  this is for +=, -=, etc
+               //  assign unique llvm names
+               const Left_Ptr     := "%_left_ptr"     | I;
+               const Left         := "%_left"         | I;
+               const Right_Ptr    := "%_right_ptr"    | I;
+               const Right        := "%_right"        | I;
+               const Result       := "%_result"       | I;
+
+               //  Get pointers and values for Left and Right
+               Load_Via_Locator(Instr.Params(), Left_Ptr, Left,
+                       Num_Indir => 1,
+                       UID_Extra => 1);
+               Load_Via_Locator(Instr.Params() + 1, Right_Ptr, Right,
+                       UID_Extra => 2);
+
+               //  perform operation with correct type
+               if Type != "i64" then
+                  const Leftc := Left | "c";
+                  const Rightc := Right | "c";
+                  const Resultc := Result | "c";
+                  //  cast to Type
+                  LL |= Leftc | " = bitcast i64 " |
+                        Left | " to " | Type;
+                  LL |= Rightc | " = bitcast i64 " |
+                        Right | " to " | Type;
+
+                  //  perform operation in that type
+                  LL |= Resultc | " = " | Name | " " | Type | " " 
+                        | Leftc | ", " | Rightc;
+
+                  //  cast back to i64
+                  LL |= Result | " = bitcast " | Type | " " |
+                        Resultc | " to i64"
+               else  
+                  LL |= Result | " = " | Name | " i64 " 
+                        | Left | ", " | Right;
+               end if
+
+               //  Store result
+               Store_Indir(Left_Ptr, Result);
+            end func Assign_Binary_Op
+
+            func Unary_Op(Op_Name : String;
+               Type : String := "") is
+               //  Assign unique llvm identifiers
+               //  Type is the llvm type of values that Op_Name
+               //  operates on.
+               //    Possible values are, "double"
+               //    or the empty string, which assumes i64
+               const N_Ptr      := "%_n_ptr"      | I;
+               const N          := "%_n"          | I;
+               const Result_Ptr := "%_result_ptr" | I;
+               const Result     := "%_result"     | I;
+
+               //  Get arguments
+               Load_Via_Locator(Instr.Params() + 1, N_Ptr, N,
+                                UID_Extra => 1);
+
+               if Op_Name == "fptosi" then
+                  const Nc := N | 'c';
+                  LL |= Nc | " = bitcast i64 " | N | " to double";
+                  LL |= Result | " = fptosi double " | Nc | " to i64";
+               elsif Op_Name[1] == '@' then
+                  LL.Declare("double " | Op_Name | "(double)");
+                  const Nc := N | 'c';
+                  const Ni := N | 'i';
+                  LL |= Nc | " = bitcast i64 " | N | " to double";
+                  LL |= Ni | " = call double " | Op_Name |
+                     "(double " | Nc | ")";
+                  if Type == "double" then
+                     LL |= Result | " = bitcast double " | Ni | " to i64";
+                  else
+                     LL |= Result | " = fptosi double " | Ni | " to i64";
+                  end if
+               elsif Op_Name == "sitofp" then
+                  const Resultc := Result | 'c';
+                  LL |= Resultc | " = sitofp i64 " | N | " to double";
+                  LL |= Result | " = bitcast double " | Resultc | " to i64";
+               elsif Type == "double" then
+                  const Nc      := N      | 'c';
+                  const Resultc := Result | 'c';
+                  LL |= Nc | " = bitcast i64 " | N | " to double";
+                  LL |= Resultc | " = " | Op_Name | " " | Nc;
+                  LL |= Result | " = bitcast double " | Resultc | " to i64";
+               else
+                  //  Perform Operation
+                  LL |= Result | " = " | Op_Name | " " | N;
+               end if
+
+               //  Store result
+               Store_Via_Locator
+                 (Instr.Params(), Result_Ptr, Result, UID_Extra => 2);
+            end func Unary_Op
+
+            func Intrinsic_Double_Int(Name : String;
+               Cast_Arg1 : String := "bitcast";
+               Cast_Res : String := "bitcast") is
+               //  Calls llvm intrinsics with the signature
+               //  Double, int -> Double
+               //  Cast_Arg1 specifies how to cast Arg1 from i64 to Double
+               //    Use 'bitcast' if Arg1 is a double
+               //      (this is necessary because stored on Stack as i64)
+               //    Use 'sitofp' if Arg1 is a signed int
+               //  Same story for Cast_Res for
+               //  casting the result to i64 to be stored
+
+               //  Assign unique llvm identifiers
+               const Arg1_Ptr   := "%_first_ptr"    | I;
+               const Arg1i      := "%_first_arg_i"  | I;
+               const Arg1       := "%_first_arg"    | I;
+               const Arg2_Ptr   := "%_secon_ptr"    | I;
+               const Arg2       := "%_secon_arg"    | I;
+               const Arg2_64    := "%_secon_arg_64" | I;
+               const Result     := "%_resul"        | I;
+               const Resulti    := "%_resul_i"      | I;
+               const Result_Ptr := "%_resul_ptr"    | I;
+
+               //  get arguments
+               Load_Via_Locator
+                 (Instr.Params() + 1, Arg1_Ptr, Arg1i, UID_Extra => 1);
+               Load_Via_Locator
+                 (Instr.Params() + 2, Arg2_Ptr, Arg2_64, UID_Extra => 2);
+
+               //  cast first argument to double
+               LL |= Arg1 | " = " | Cast_Arg1 | " i64 " |
+                  Arg1i | " to double"
+
+               //  Call intrinsic
+               LL.Declare("double @llvm." | Name | ".f64(double, i32)");
+               LL |= Arg2 | " = trunc i64 " | Arg2_64 | " to i32"
+               LL |= Result | " = call double @llvm." | Name |
+                     ".f64(double " | Arg1 | ", i32 " | Arg2 | ")";
+
+               //  cast back to int to be stored in Local_Area
+               if Cast_Res[1] == '@' then
+                  LL.Declare("double " | Cast_Res | "(double)");
+                  const Result_Double := "%_resul_double" | I;
+                  LL |= Result_Double | " = call double " | Cast_Res |
+                     "(double " | Result | ")";
+                  LL |= Resulti | " = fptosi double " | Result_Double |
+                     " to i64";
+               else
+                  LL |= Resulti | " = " | Cast_Res | " double " |
+                     Result | " to i64"
+               end if
+               
+               //  Store result
+               Store_Via_Locator
+                 (Instr.Params(), Result_Ptr, Resulti, UID_Extra => 3);
+            end func Intrinsic_Double_Int
+
+            func Assign_Intrinsic_Double_Int(Name : String;
+               Cast_Arg1 : String := "bitcast";
+               Cast_Res : String := "bitcast") is
+               //  See the comment for Intrinsic_Double_Int
+               //  The only difference is that this
+               //  takes a 'var' left parameter
+
+               //  Assign unique llvm identifiers
+               const Arg1_Ptr     := "%_first_ptr"     | I;
+               const Arg1_Int     := "%_first_arg_i"   | I;
+               const Arg1         := "%_first_arg"     | I;
+               const Arg2_Ptr     := "%_secon_ptr"     | I;
+               const Arg2         := "%_secon_arg"     | I;
+               const Arg2_64      := "%_secon_arg_64"  | I;
+               const Result       := "%_resul"         | I;
+               const Resulti      := "%_resul_i"       | I;
+
+               //  get arguments
+               Load_Via_Locator(Instr.Params(), Arg1_Ptr, Arg1_Int,
+                       Num_Indir => 1,
+                       UID_Extra => 1);
+               Load_Via_Locator
+                 (Instr.Params() + 1, Arg2_Ptr, Arg2_64, UID_Extra => 2);
+
+               //  cast first argument to double
+               LL |= Arg1 | " = " | Cast_Arg1 | " i64 " |
+                  Arg1_Int | " to double"
+
+               //  Call intrinsic
+               LL.Declare("double @llvm." | Name | ".f64(double, i32)");
+               LL |= Arg2 | " = trunc i64 " | Arg2_64 | " to i32"
+               LL |= Result | " = call double @llvm." | Name |
+                     ".f64(double " | Arg1 | ", i32 " | Arg2 | ")";
+
+               //  Store result
+               if Cast_Res[1] == '@' then
+                  LL.Declare("double " | Cast_Res | "(double)");
+                  const Result_Double := "%_result_double" | I;
+                  LL |= Result_Double | " = call double " | Cast_Res |
+                     "(double " | Result | ")";
+                  LL |= Resulti | " = fptosi double " | Result_Double |
+                     " to i64";
+               else
+                  LL |= Resulti | " = " | Cast_Res | " double " |
+                     Result | " to i64"
+               end if
+               Store_Indir(Arg1_Ptr, Resulti);
+            end func Assign_Intrinsic_Double_Int
+
+            func Call_Builtin_Op(Name : String;
+               In_Is_i64 : Bool := #true;
+               Out_Is_i64 : Bool := #true) is
+               //  In and Out are true for i64 and false for double
+               //  Name llvm identifiers
+               const Arg1_Ptr   := "%_first_ptr" | I;
+               const Arg1       := "%_first_arg" | I;
+               const Arg2_Ptr   := "%_secon_ptr" | I;
+               const Arg2       := "%_secon_arg" | I;
+               const Result     := "%_resul"     | I;
+               const Result_Ptr := "%_resul_ptr" | I;
+
+               //  get arguments
+               Load_Via_Locator
+                 (Instr.Params() + 1, Arg1_Ptr, Arg1, UID_Extra => 1);
+               Load_Via_Locator
+                 (Instr.Params() + 2, Arg2_Ptr, Arg2, UID_Extra => 2);
+
+               if In_Is_i64 and Out_Is_i64 then
+                  //  int compare, min, max
+                  LL.Declare("i64 " | Name | "(i64, i64)");
+                  LL |= Result | " = call i64 " | Name | "(i64 " | Arg1 |
+                     ", i64 " | Arg2 | ")";
+               elsif not In_Is_i64 and Out_Is_i64 then
+                  //  real compare
+                  const Arg1c := Arg1 | 'c';
+                  const Arg2c := Arg2 | 'c';
+                  LL.Declare("i64 " | Name | "(double, double)");
+                  LL |= Arg1c | " = bitcast i64 " | Arg1 | " to double";
+                  LL |= Arg2c | " = bitcast i64 " | Arg2 | " to double";
+                  LL |= Result | " = call i64 " | Name | "(double " |
+                     Arg1c | ", double " | Arg2c | ")";
+               elsif not In_Is_i64 and not Out_Is_i64 then
+                  //  real min, max
+                  const Arg1c := Arg1 | 'c';
+                  const Arg2c := Arg2 | 'c';
+                  const Resultc := Result | 'c';
+                  LL.Declare("double " | Name | "(double, double)");
+                  LL |= Arg1c | " = bitcast i64 " | Arg1 | " to double";
+                  LL |= Arg2c | " = bitcast i64 " | Arg2 | " to double";
+                  LL |= Resultc | " = call double " | Name | "(double " |
+                     Arg1c | ", double " | Arg2c | ")";
+                  LL |= Result | " = bitcast double " | Result | " to i64";
+               else
+                  //  i64, i64 -> double
+                  //  Not needed at the moment
+                  {#false};
+               end if
+
+               //  Store result
+               Store_Via_Locator
+                 (Instr.Params(), Result_Ptr, Result, UID_Extra => 3);
+            end func Call_Builtin_Op
+
+            func Call_Compare_Op(Name : String;
+               Is_Real_Op : Bool := #false) is
+              //  We are calling a "=?" (compare) operation.
+              //  Check to see if we immediately perform a "to_bool" on
+              //  the result.  If so, replace with the appropriate
+              //  llvm comparison.
+
+              //  TBD: Handle case where "=?" is followed immediately
+              //       by an "if_op," as in range membership tests,
+              //       and do the appropriate compare/conditional branch.
+              //       Also handle case where an "if_op" follows
+              //       the "to_bool" immediately, and do a simple
+              //       conditional branch.
+
+               const Num_Instrs := Operation_Routine.Num_Instrs();
+
+               if I + 2 > Num_Instrs then
+                  //  Compare cannot be optimized
+                  Call_Builtin_Op(Name, In_Is_i64 => not Is_Real_Op);
+                  return;
+               end if
+
+               const Next := Operation_Routine.Nth_Instr(I + 1);
+               //  NNex is the Next Next instruction
+               const NNex := Operation_Routine.Nth_Instr(I + 2);
+
+               //  Get the designator of the Next Next instruction
+               //  if it's a Call_Op
+               var Desig_NNex : optional String;
+               if Opcode(NNex) == #Call_Op
+                     and then NNex.Call_Target() not null
+                     and then Base(NNex.Call_Target()) == Zero_Base then
+                  Desig_NNex := Built_In_Desig(
+                     Reflection::Routine::Routine_At_Locator(
+                     NNex.Call_Target()));
+               end if
+
+               //  Check for the correct sequence of instructions
+               //  And make sure calls are on compare and ordering_to_bool
+               if Opcode(Next) == #Store_Int_Lit_Op
+                 and then Opcode(NNex) == #Call_Op
+                 and then Desig_NNex not null
+                 and then Desig_NNex == "#ordering_to_bool"
+                 and then
+                   //  And make sure parameters match up
+                   //  =?'s output is input to to_bool
+                   Base(Params(Instr)) == Base(Params(NNex))
+                 and then
+                   Offset(Params(Instr)) == Offset(Params(NNex)) + 1
+                   //  Store Int is input to to_bool
+                 and then
+                   Base(Destination(Next)) == Base(Params(NNex))
+                 and then
+                   Offset(Destination(Next)) == Offset(Params(NNex)) + 2
+                   //  No intervening labels
+                 and then
+                   not LL.Has_Label(I <.. I + 2)
+               then
+                  //  All the conditions are satisfied, we can use the
+                  //  icmp or fcmp instruction instead of the compare.
+                  var Cmp_Type : String;
+                  const Is_Int : Bool := not Is_Real_Op;
+                  if Is_Int then
+                     //  0th bit is less
+                     //  1st bit is equal
+                     //  2nd bit is greater
+                     //  3rd bit is unordered (ignored)
+                     case Next.Int_Value() of
+                        //  integer compare (icmp) op codes
+                        [0 |  8] => Cmp_Type := "false";
+                        [1 |  9] => Cmp_Type := "slt"; //  signed <
+                        [2 | 10] => Cmp_Type := "eq";  //  ==
+                        [3 | 11] => Cmp_Type := "sle"; //  signed <=
+                        [4 | 12] => Cmp_Type := "sgt"; //  signed >
+                        [5 | 13] => Cmp_Type := "ne";  //  !=
+                        [6 | 14] => Cmp_Type := "sge"; //  signed >=
+                        [7 | 15] => Cmp_Type := "true";
+                        [..] => {#false}
+                     end case;
+                  else
+                     case Next.Int_Value() of
+                        //  float compare (fcmp) op codes
+                        [0 |  8] => Cmp_Type := "false";
+                        [1 |  9] => Cmp_Type := "olt"; //  ordered <
+                        [2 | 10] => Cmp_Type := "oeq"; //  ordered ==
+                        [3 | 11] => Cmp_Type := "ole"; //  ordered <=
+                        [4 | 12] => Cmp_Type := "ogt"; //  ordered >
+                        [5 | 13] => Cmp_Type := "one"; //  ordered !=
+                        [6 | 14] => Cmp_Type := "oge"; //  ordered >=
+                        [7 | 15] => Cmp_Type := "true";
+                        [..] => {#false}
+                     end case;
+                  end if
+                  //  Assign llvm identifiers
+                  const Left_Ptr   := "%_left_ptr"   | I;
+                  const Right_Ptr  := "%_right_ptr"  | I;
+                  const Result_Ptr := "%_result_ptr" | I;
+                  const Left       := "%_left"       | I;
+                  const Right      := "%_right"      | I;
+                  const Result     := "%_result"     | I;
+
+                  //  Get Operands
+                  LL |= "; =? to_bool optimization";
+                  Load_Via_Locator(Instr.Params() + 1, Left_Ptr, Left);
+                  Load_Via_Locator(Instr.Params() + 2, Right_Ptr, Right);
+
+                  if Is_Int then
+                     //  make Comparison
+                     LL |= Result | " = icmp " | Cmp_Type |
+                        " i64 " | Left | ", " | Right;
+                  else
+                     //  cast to double then compare
+                     const Leftc := Left | "c";
+                     const Rightc := Right | "c";
+                     LL |= Leftc | " = bitcast i64 " |
+                        Left | " to double";
+                     LL |= Rightc | " = bitcast i64 " |
+                        Right | " to double";
+                     LL |= Result | " = fcmp " | Cmp_Type |
+                        " double " | Leftc | ", " | Rightc;
+                  end if
+                  //  Result now holds an i1 that is the result
+                  //  of the comparison (for floats or ints)
+
+                  //  See whether next instruction is an "if_op"
+                  const If_Offs := 3
+                  if I + If_Offs <= Num_Instrs then
+                     const If_Instr :=
+                       Operation_Routine.Nth_Instr(I + If_Offs);
+                     if Opcode(If_Instr) == #If_Op
+                       and then If_Source(If_Instr) == Params(NNex)
+                       and then If_Condition(If_Instr) == #compare_equal
+                       and then not LL.Has_Label(I+If_Offs .. I+If_Offs)
+                     then
+                        //  We are followed by an if_op; incorporate that
+                        //  into the generated code
+                        const True := LL.Add_Label(If_Offs);  // After if_op
+                        const False :=
+                          LL.Add_Label(If_Instr.Skip_If_False() + If_Offs);  
+
+                        LL |= "br i1 " | Result | ", label " | True |
+                                                        ", label " | False;
+                        //  We generated code for three extra instructions
+                        Look_Ahead_Count := If_Offs;
+
+                        return;  //  All done  //
+                     end if
+                  end if
+
+                  //  Zero extend and store
+                  const Result_Ext := Result | "_zext";
+                  LL |= Result_Ext | " = zext i1 "| Result | " to i64";
+                  Store_Via_Locator(NNex.Params(), Result_Ptr, Result_Ext,
+                                    Instr_Look_Ahead => 2)
+
+                  //  We generated code for two extra instructions
+                  Look_Ahead_Count := 2;
+
+               else
+                  //  Compare cannot be optimized
+                  Call_Builtin_Op(Name, In_Is_i64 => not Is_Real_Op);
+               end if
+            end func Call_Compare_Op
+
+            //  If we are using locking, then don't try to inline the call.
+
+            if Locked_Param_Info > 0 then
+               Call();
+               LL.Next_PSIR_Instr();
+               return;
+            end if
+
+            if Desig is null then
+               Call(); //  Not a built-in
+            else
+               //  A non-null designator means it's a builtin
+               //  Some builtins are simple enough to be inlined in llvm
+
+               case Desig of
+                  ["\"+\""] =>
+                     //  nsw = "no signed wrap"
+                     //  it means treat them as signed numbers and
+                     //  overflow results in an llvm poison value
+                     Binary_Op("add nsw");
+                  ["\"-\""] =>
+                     Binary_Op("sub nsw");
+                  ["\"*\""] =>
+                     Binary_Op("mul nsw");
+                  ["\"/\""] =>
+                     Binary_Op("sdiv");
+                  ["\"<<\""] =>
+                     //  shift left
+                     Binary_Op("shl");
+                  ["\">>\""] =>
+                     //  arithmetic shift right
+                     Binary_Op("ashr");
+                  ["\"mod\""] =>
+                     //  using this equivalence
+                     //  a mod n == ((a rem n) + n) rem n
+
+                     //  Assign unique llvm identifiers
+                     const A              := "%_a"              | I;
+                     const A_Ptr          := "%_a_ptr"          | I;
+                     const N              := "%_n"              | I;
+                     const N_Ptr          := "%_n_ptr"          | I;
+                     const A_Rem_N        := "%_a_rem_n"        | I;
+                     const A_Rem_N_Plus_N := "%_a_rem_n_plus_n" | I;
+                     const Result         := "%_result"         | I;
+                     const Result_Ptr     := "%_result_ptr"     | I;
+
+                     //  Get arguments
+                     Load_Via_Locator
+                       (Instr.Params() + 1, A_Ptr, A, UID_Extra => 1);
+                     Load_Via_Locator
+                       (Instr.Params() + 2, N_Ptr, N, UID_Extra => 2);
+
+                     //  Result := ((a rem n) + n) rem n
+                     LL |= A_Rem_N | " = srem i64 " | A | ", " | N;
+                     LL |= A_Rem_N_Plus_N | " = add nsw i64 " | A_Rem_N |
+                           ", " | N;
+                     LL |= Result | " = srem i64 " | A_Rem_N_Plus_N |
+                           ", " | N;
+
+                     //  Store Result
+                     Store_Via_Locator(Instr.Params(), Result_Ptr, Result,
+                          UID_Extra => 3);
+                  ["\"rem\""] =>
+                     Binary_Op("srem");
+                  ["\"and\"" | "#bit_and"] =>
+                     Binary_Op("and");
+                  ["\"or\"" | "#bit_or"] =>
+                     Binary_Op("or");
+                  ["\"xor\"" | "#bit_xor"] =>
+                     Binary_Op("xor");
+                  ["\"+=\""] =>
+                     //  nsw = 'no signed wrap'
+                     //  overflow results in llvm 'poison'
+                     Assign_Binary_Op("add nsw");
+                  ["\"-=\""] =>
+                     Assign_Binary_Op("sub nsw");
+                  ["\"*=\""] =>
+                     Assign_Binary_Op("mul nsw");
+                  ["\"/=\""] =>
+                     Assign_Binary_Op("sdiv");
+                  ["#real_add"] =>
+                     Binary_Op("fadd", "double");
+                  ["#real_subtract"] =>
+                     Binary_Op("fsub", "double");
+                  ["#real_multiply"] =>
+                     Binary_Op("fmul", "double");
+                  ["#real_int_multiply"] =>
+                     //  convert second arg by signed int to floating point
+                     //  Instead of the usual bitcast
+                     Binary_Op("fmul", "double", "sitofp");
+                  ["#real_int_divide"] =>
+                     Binary_Op("fdiv", "double", "sitofp");
+                  ["#real_divide"] =>
+                     Binary_Op("fdiv", "double");
+                  ["#real_exp"] => 
+                     Intrinsic_Double_Int("powi");
+                  ["#real_assign_exp"] =>
+                     Assign_Intrinsic_Double_Int("powi");
+                  ["\"**\""] => 
+                     //  TBD: Check for "2 ** X" and use "1 << X"
+                     Call();  //  Use out-of-line exponentiation
+                  ["\"**=\""] =>
+                     Call();  //  Use out-of-line exponentiation
+                  ["#real_assign_add"] =>
+                     Assign_Binary_Op("fadd", "double");
+                  ["#real_assign_subtract"] =>
+                     Assign_Binary_Op("fsub", "double");
+                  ["#real_assign_multiply"] =>
+                     Assign_Binary_Op("fmul", "double");
+                  ["#real_assign_divide"] =>
+                     Assign_Binary_Op("fdiv", "double");
+                  ["#identity" | "#integer_from_univ" | "#integer_to_univ"] =>
+                     //  Copy from Params[1] to Params[0]
+                     Copy_Word(Instr.Params() + 1, Instr.Params());
+                  ["#negate"] =>
+                     //  -x == 0 - x
+                     Unary_Op("sub i64 0,");
+                  ["#real_negate"] =>
+                     Unary_Op("fsub double 0.0,",
+                        Type => "double");
+                  ["#bit_not"] =>
+                     //  llvm doesn't have 'not'
+                     //  bit-not X == xor X, -1
+                     Unary_Op("xor i64 -1,");
+                  ["\"not\""] =>
+                     //  llvm doesn't have 'not'
+                     //  not X == xor X, 1 
+                     Unary_Op("xor i64 1,");
+                  ["#round_to_int"] =>
+                     //  floating point to signed int
+                     Unary_Op("@llvm.round.f64");
+                  ["#int_to_real"] =>
+                     //  signed int to floating point
+                     Unary_Op("sitofp");
+                  ["\"abs\""] =>
+                     //  http://graphics.stanford.edu/~seander/
+                     //  bithacks.html#IntegerAbs
+
+                     //  func abs(n : i64) -> i64 is
+                     //     mask := n >> 63
+                     //     return (mask + n) xor mask
+
+                     //  Assign unique llvm identifiers
+                     const Mask        := "%_mask"       | I;
+                     const Mask_Plus_N := "%_mask_n"     | I;
+                     const N_Ptr       := "%_n_ptr"      | I;
+                     const N           := "%_n"          | I;
+                     const Result      := "%_result"     | I;
+                     const Put_Result  := "%_put_result" | I;
+
+                     //  Compute absolute value
+                     Load_Via_Locator
+                       (Instr.Params() + 1, N_Ptr, N, UID_Extra => 1);
+                     LL |= Mask | " = ashr i64 " | N | ", 63";
+                     LL |= Mask_Plus_N | " = add i64 " | Mask | ", " | N;
+                     LL |= Result | " = xor i64 " | Mask_Plus_N | ", " | Mask;
+
+                     //  Store result
+                     Store_Via_Locator(Instr.Params(), Put_Result, Result,
+                          UID_Extra => 2);
+                  ["#real_abs"] =>
+                     Unary_Op("@llvm.fabs.f64",
+                        Type => "double");
+                  ["#real_compare"] =>
+                     Call_Compare_Op("@_psc_real_compare_op",
+                        Is_Real_Op  => #true);
+                  ["#real_min"] =>
+                     Call_Builtin_Op("@_psc_univ_real_min_op",
+                        In_Is_i64  => #false,
+                        Out_Is_i64 => #false);
+                  ["#real_max"] =>
+                     Call_Builtin_Op("@_psc_univ_real_max_op",
+                        In_Is_i64  => #false,
+                        Out_Is_i64 => #false);
+                  ["\"=?\""] => Call_Compare_Op("@_psc_word_compare_op");
+                  ["#min"] => Call_Builtin_Op("@_psc_word_type_min_op");
+                  ["#max"] => Call_Builtin_Op("@_psc_word_type_max_op");
+                  ["\"null\""] => null;
+                  ["#basic_array_length"] =>
+                     //  func Length(V : Basic_Array) -> Univ_Integer<>
+                     if not Virt_Is_Phys then
+                        //  Call basic_array_length out of line.
+                        Call();
+                     else
+                        //  Emit basic_array_length inline.
+                        //  TBD: Doesn't check for null.
+
+                        //  Assign unique llvm identifiers
+                        const Arr_Ptr_Ptr := "%_arr_ptr_ptr" | I;
+                        const Arr_Ptr     := "%_arr_ptr"   | I;
+                        const Len_Addr    := "%_arr_base"  | I;
+                        const Result      := "%_resul"     | I;
+                        const Result_Ptr  := "%_resul_ptr" | I;
+
+                        //  get argument
+                        Load_Via_Locator
+                          (Instr.Params() + 1, Arr_Ptr_Ptr, Arr_Ptr,
+                           Ptr_Level => 1,
+                           UID_Extra => 1);
+
+                        //  Len_Addr := Arr_Ptr + 1
+                        LL |= Len_Addr | " = getelementptr i64* " | Arr_Ptr |
+                          ", i64 1";
+
+                        LL |= Result | " = load i64* " | Len_Addr;
+
+                        Store_Via_Locator(Instr.Params(), Result_Ptr, Result,
+                             UID_Extra => 2);
+                     end if
+
+                  ["#basic_array_indexing"] =>
+                     //  op "indexing"
+                     //     (ref V : Basic_Array; Index : Univ_Integer<>)
+                     //      -> ref Element_Type
+                     if not Virt_Is_Phys then
+                        //  Call basic_array_indexing out of line.
+                        Call();
+                     else
+                        //  Emit basic_array_indexing inline.
+                        //  TBD: Doesn't do any array bounds checking!
+
+                        //  Assign unique llvm identifiers
+                        const Arr_Ptr_Ptr := "%_arr_ptr_ptr" | I;
+                        const Arr_Ptr     := "%_arr_ptr"   | I;
+                        const Arr_Base    := "%_arr_base"  | I;
+                        const Index_Ptr   := "%_index_ptr" | I;
+                        const Index       := "%_index_arg" | I;
+                        const Result_Addr := "%_resul_addr"| I;
+                        const Result_Ptr  := "%_resul_ptr" | I;
+
+                        //  get array argument
+                        Load_Via_Locator
+                          (Instr.Params() + 1, Arr_Ptr_Ptr, Arr_Ptr,
+                           Num_Indir => 1,
+                           Ptr_Level => 1,
+                           UID_Extra => 1);
+
+                        //  Arr_Base := Obj + 1
+                        LL |= Arr_Base | " = getelementptr i64* " | Arr_Ptr |
+                          ", i64 1";
+
+                        // get index argument
+                        Load_Via_Locator(Instr.Params() + 2, Index_Ptr, Index,
+                          UID_Extra => 2);
+
+                        //  Result_Addr := Arr_Base + Index
+                        LL |= Result_Addr | " = getelementptr i64* " |
+                          Arr_Base | ", i64 " | Index;
+                        Store_Via_Locator(Instr.Params(), Result_Ptr,
+                             Result_Addr,
+                             Ptr_Level => 1,
+                             UID_Extra => 3);
+                     end if
+
+                  [..] => Call(); //  Built-ins that aren't llvm inlined
+               end case
+            end if
+
+         [#Return_Op | #Exit_Op] =>
+            //  TODO Return_Op postcondition proved
+            const Is_Return := Opcode(Instr) == #Return_Op;
+            const Is_Exit := not Is_Return;
+
+            Finalize_If_Needed(LL, I, Uses_Rgn);
+            
+            if Is_Exit then
+               {Instr.Level_Diff() - 1 >= 0}
+               {Instr.Skip_Count() >= 0}
+               const LD : Int := Instr.Level_Diff() - 1;
+               const SC : Int := Instr.Skip_Count();
+               //  Build the 32 bit result with the level diff as
+               //  the high 16 bits and the skip count as the low 16 bits
+               const Result : Int := 2**16 * LD + SC;
+               LL |= "ret i32 " | Result;
+            elsif LL.In_Nested_Block(I) then
+               //  Want to return from enclosing function
+               //  Pass a level diff that will never reach zero by subtraction
+               //  (Level_Diff => -1, Skip => 0) == 0xFFFF0000 == 4294901760
+               LL |= "ret i32 4294901760";
+            else
+               //  Not in block, no llvm return value
+               LL |= "ret void";
+            end if
+
+         [#Copy_Word_Op] =>
+            Copy_Word(Instr.Source(), Instr.Destination());
+
+         [#Store_Address_Op] =>
+            //  Assign unique llvm identifiers
+            const Addr := "%_addr" | I;
+            const Addr_As_Int := "%_addr_as_int" | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+            const Dest_Ptr_Ptr := "%_dest_ptr_Ptr" | I;
+
+            //  Get source address
+            Get_Locator_Ptr(Instr.Source(), Addr, UID_Extra => 1);
+            LL |= Addr_As_Int | " = ptrtoint i64* " | Addr | " to i64";
+
+            //  Store source address into destination
+            Store_Via_Locator
+              (Instr.Destination(), Dest_Ptr, Addr_As_Int, UID_Extra => 2);
+
+         [#Create_Obj_Op] =>
+            //  Assign unique llvm identifiers
+            const Dest_Addr := "%_dest_addr" | I;
+            const Dest_Val  := "%_dest"      | I;
+            const Desc      := "%_desc"      | I;
+            const Src_Addr  := "%_src_addr"  | I;
+            const Src_Val   := "%_src"       | I;
+
+            //  Get arguments
+            Get_Type_Desc(Instr.Type_Info(), Desc);
+            const Source_Loc := Instr.Source()
+
+            if Source_Loc.Base() == Zero_Base then
+               LL |= Src_Val | " = bitcast i64 0 to i64"
+            else
+               Load_Via_Locator(Source_Loc, Src_Addr, Src_Val, UID_Extra => 2);
+            end if
+
+            //  Call run time system builtin
+            const Func := "i64 @_psc_new_object";
+            LL.Declare(Func | "(i64*, i64*, i64)");
+            LL |= Dest_Val | " = call " | Func |
+              "(i64* %_Context, i64* " | Desc | ", i64 " | Src_Val | ")";
+            Store_Via_Locator(Instr.Destination(), Dest_Addr, Dest_Val,
+              UID_Extra => 1)
+
+         [#Assign_Word_Op] =>
+            //  Assign llvm identifiers
+            const Desc       := "%_desc"       | I;
+            const Dest_Ptr   := "%_dest_ptr"   | I;
+            const Source     := "%_source"     | I;
+            const Source_Ptr := "%_source_ptr" | I;
+
+            //  Get arguments
+            Get_Type_Desc(Instr.Type_Info(), Desc);
+            Load_Via_Locator
+              (Instr.Source(), Source_Ptr, Source, UID_Extra => 1);
+            Get_Locator_Ptr(Instr.Destination(), Dest_Ptr, UID_Extra => 2);
+
+            //  Call _psc_assign_word
+            LL.Declare("void @_psc_assign_word(i64*, i64*, i64*, i64)");
+            LL |= "call void @_psc_assign_word(i64* %_Context, i64* " |
+               Desc | ", i64* " | Dest_Ptr | ", i64 " | Source | ")";
+
+         [#Swap_Obj_Op] =>
+            //  Assign llvm identifiers
+            const Desc := "%_desc" | I;
+            const Source_Ptr := "%_source_ptr" | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+
+            //  Get arguments
+            Get_Locator_Ptr(Instr.Source(), Source_Ptr, UID_Extra => 1);
+            Get_Locator_Ptr(Instr.Destination(), Dest_Ptr, UID_Extra => 2);
+            Get_Type_Desc(Instr.Type_Info(), Desc);
+
+            //  Call _psc_swap_object
+            LL.Declare("void @_psc_swap_object(i64*, i64*, i64*, i64*)");
+            LL |= "call void @_psc_swap_object(i64* %_Context, i64* " | Desc |
+               ", i64* " | Dest_Ptr | ", i64* " | Source_Ptr | ")";
+
+         [#Move_Obj_Op] =>
+            //  Assign unique llvm identifiers
+            const Source_Ptr := "%_source_ptr" | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+            const Desc := "%_desc" | I;
+
+            //  Get arguments
+            Get_Locator_Ptr(Instr.Source(), Source_Ptr, UID_Extra => 1);
+            Get_Locator_Ptr(Instr.Destination(), Dest_Ptr, UID_Extra => 2);
+            Get_Type_Desc(Instr.Type_Info(), Desc);
+
+            //  call _psc_move_object
+            LL.Declare("void @_psc_move_object(i64*, i64*, i64*, i64*)");
+            LL |= "call void @_psc_move_object(i64* %_Context, i64* " | Desc |
+               ", i64* " | Dest_Ptr | ", i64* " | Source_Ptr | ")";
+
+         [#Make_Copy_In_Stg_Rgn_Op] =>
+            //  Assign identifers and get arguments
+            const Source_Ptr   := "%_source_ptr"   | I;
+            const Source       := "%_source"       | I;
+            const Result       := "%_result"       | I;
+            const Dest_Ptr     := "%_dest_ptr"     | I;
+            const Existing_Ptr := "%_existing_ptr" | I;
+            const Existing_Obj := "%_existing_obj" | I;
+            const Desc         := "%_desc"         | I;
+
+            Get_Type_Desc(Instr.Type_Info(), Desc);
+
+            Load_Via_Locator
+              (Instr.Source(), Source_Ptr, Source, UID_Extra => 2)
+            Load_Via_Locator
+              (Instr.Existing_Obj_In_Stg_Rgn(), Existing_Ptr, Existing_Obj,
+               UID_Extra => 3);
+
+            //  Call _psc_copy_object
+            const Fn_Name := "i64 @_psc_copy_object";
+            LL.Declare(Fn_Name | "(i64*, i64*, i64, i64)");
+            LL |= Result | " = call " | Fn_Name |
+                      "(i64* %_Context, i64* " | Desc |
+                      ", i64 " | Source | ", i64 " | Existing_Obj | ")";
+
+            if VN_IL not null then
+               //  Make sure we don't use same LLVM register for result
+               //  as for input, since it might have been copied into
+               //  a new region.
+               VN_IL.Object_Was_Copied(I, Instr.Destination())
+            end if
+
+            Store_Via_Locator
+              (Instr.Destination(), Dest_Ptr, Result, UID_Extra => 1);
+
+         [#Store_Local_Null_Op] =>
+            //  Assign identifiers and get arguments
+            const Null     := "%_null"     | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+            const Null_Loc := Null_Type_Info(Instr);
+
+            Get_Null(Null_Loc, Null);
+
+            //  Store null into destination
+            Store_Via_Locator
+              (Instr.Destination(), Dest_Ptr, Null, UID_Extra => 1);
+
+         [#Store_Large_Local_Null_Op] =>
+            const Null     := "%_null"     | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+            const Local    := "%_Local"    | I;
+            LL.Declare("i64 @_psc_large_local_null(i64*)");
+            Get_Locator_Ptr(Instr.Local_Addr(), Local,
+                          UID_Extra => 1);
+            LL |= Null | 
+               " = call i64 @_psc_large_local_null(i64* " | Local | ")";
+            //  Store null into destination
+            Store_Via_Locator
+              (Instr.Destination(), Dest_Ptr, Null, UID_Extra => 2);
+
+         [#Store_Null_Of_Same_Stg_Rgn_Op] =>
+            //  Assign identifiers and get arguments
+            const Null := "%_null" | I;
+            const Desc := "%_desc" | I;
+            const Source_Ptr := "%_source_ptr" | I;
+            const Source_Val := "%_source" | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+
+            Get_Type_Desc(Instr.Type_Info(), Desc);
+            Load_Via_Locator(Instr.Source(), Source_Ptr, Source_Val,
+                             UID_Extra => 1);
+
+            // call RTS builtin
+            const Func := "i64 @_psc_null_of_same_stg_rgn";
+            LL.Declare(Func | "(i64*, i64)");
+            LL |= Null | " = call " | Func | "(i64* " |
+                     Desc | ", i64 " | Source_Val | ")";
+
+            //  Store null into destination
+            Store_Via_Locator
+              (Instr.Destination(), Dest_Ptr, Null, UID_Extra => 2);
+
+         [#Is_Null_Op] =>
+            Check_Is_Null(Instr.Type_Info());
+
+         [#Not_Null_Op] =>
+            Check_Is_Null(Instr.Type_Info(), For_Not_Null => #true);
+
+         [#Store_Int_Lit_Op] =>
+            const DestID := "%_dest" | I;
+
+            //  Store the source value into the destination
+            Store_Via_Locator
+              (Instr.Destination(), DestID, To_String(Instr.Int_Value()),
+               UID_Extra => 1);
+
+         [#Store_Real_Lit_Op] =>
+            const DestID := "%_dest" | I;
+            const Val    := "%_val"  | I;
+
+            //  bitcast from double to i64
+            LL |= Val | " = bitcast double " | Instr.Real_Value() | " to i64";
+
+            //  Store the source value into the destination
+            Store_Via_Locator
+              (Instr.Destination(), DestID, Val, UID_Extra => 1);
+
+         [#Store_Char_Lit_Op] =>
+            const DestID := "%_dest" | I;
+
+            //  Store the character as unicode into the destination
+            Store_Via_Locator
+              (Instr.Destination(), DestID,
+               To_String(Instr.Char_Value() - Char::First()), UID_Extra => 1);
+
+         [#Store_Enum_Lit_Op] =>
+            const DestID := "%_dest" | I;
+
+            //  Store the reconstructed enum into the destination
+            const Enum_Val := "%_enum_val" | I
+            //  Note that univ-string and univ-enum use the same string table.
+            Get_Recon_String_Id
+              (To_String(Instr.Enum_Value()), Gets => Enum_Val);
+
+            Store_Via_Locator
+              (Instr.Destination(), DestID, Enum_Val, UID_Extra => 1);
+
+         [#Store_Str_Lit_Op] =>
+            const DestID := "%_dest" | I;
+
+            //  Store the reconstructed string into the destination
+            const Str_Id_Val := "%_str_id_val" | I
+            const Str_Val := "%_str_val" | I
+
+            Get_Recon_String_Id(Instr.Str_Value(), Gets => Str_Id_Val);
+            if not Is_Null_Locator(Instr.Existing_Str_In_Stg_Rgn()) then
+               //  Region was specified
+               const ExistingID := "%_existing" | I;
+               const Existing_ValID := "%_existing_val" | I;
+
+               //  Read the value of the existing obj
+               Load_Via_Locator
+                 (Instr.Existing_Str_In_Stg_Rgn(), ExistingID, Existing_ValID,
+                  UID_Extra => 2);
+               LL.Declare("i64 @_psc_str_lit_in_rgn(i64, i64)");
+               LL |= Str_Val |
+                 " = call i64 @_psc_str_lit_in_rgn(i64 " | Str_Id_Val |
+                 ", i64 " | Existing_ValID | ")";
+            else
+               //  Implicitly in local region
+               LL.Declare("i64 @_psc_local_str_lit(i64*, i64)");
+               LL |= Str_Val |
+                  " = call i64 @_psc_local_str_lit(i64* %_Context, i64 " |
+                  Str_Id_Val | ")";
+
+            end if;
+            Store_Via_Locator
+              (Instr.Destination(), DestID, Str_Val, UID_Extra => 1);
+
+         [#Store_Operation_Desc_Op] =>
+            const Operation_Static_Link := "%_operation_static_link" | I;
+            const Op_Desc               := "%_op_desc"               | I;
+            var Target_Func             := "null";
+
+            //  Get locators for convenience
+            const Op_Loc := Instr.Operation_Locator();
+            const SL_Loc := Instr.Operation_Static_Link()
+            const SL_Base := Base(SL_Loc);
+
+            const Routine_TDesc := Routine_And_TDesc_For_Call(Op_Loc, SL_Loc);
+            //  Don't find the name if it's Type_Area because there are
+            //  some builtins without exported names. Those need to be
+            //  called indirectly
+            if Routine_TDesc.First not null and Base(Op_Loc) != Type_Area then
+               Target_Func := Get_Name(Routine_TDesc.First);
+            end if
+
+            if SL_Base == Zero_Base or SL_Base == Type_Area or
+               SL_Base in Enclosing_Type_Areas then
+               Get_Type_Desc(SL_Loc, Operation_Static_Link,
+                  Routine_TDesc.Second);
+            else
+               Get_Locator_Ptr(SL_Loc, Operation_Static_Link);
+            end if
+
+            //  Call out-of-line function
+            const Create := "i64 @_psc_create_operation_desc";
+            LL.Declare(Create | "(i64*, i16, i16, i16, i16, i64*, " |
+               "void(i64*, i64*, i64*)*)");
+            LL |= Op_Desc | " = call " | Create | "(i64* %_Context, i16 " |
+               Base(Op_Loc) | ", i16 " | Offset(Op_Loc) | ", i16 " |
+               SL_Base | ", i16 " | Offset(SL_Loc) | ", i64* " |
+               Operation_Static_Link | ", void(i64*, i64*, i64*)* " |
+               Target_Func | ")";
+
+            //  Store Operation Descriptor into the Destination
+            const Dest_Ptr := "%_dest_ptr" | I;
+            Store_Via_Locator
+              (Instr.Destination(), Dest_Ptr, Op_Desc, UID_Extra => 1);
+
+         [#Store_Type_Related_Const_Op] =>
+            const TDesc    := "%_tdesc"    | I;
+            const Val      := "%_val"      | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+
+            //  Get inputs to out-of-line function
+            Get_Type_Desc(Instr.Source_Type_Info(), TDesc);
+
+            //  Note: it's Offset then Base here
+            const Nth := "i64 @_psc_nth_type_area_word";
+            LL.Declare(Nth | "(i64*, i16, i16)");
+            LL |= Val | " = call " | Nth | "(i64* " | TDesc | ", i16 " |
+               Offset(Instr.Source()) | ", i16 " | Base(Instr.Source()) | ")";
+
+            //  Store output from out-of-line function
+            Store_Via_Locator(Instr.Destination(), Dest_Ptr, Val);
+
+         [#Start_Parallel_Op | #Add_Parallel_Op |
+          #Start_Parallel_Call_Op | #Add_Parallel_Call_Op] =>
+            //  TODO: Precond Proved
+            const Op := Opcode(Instr);
+            const Is_Start_Op := (Op == #Start_Parallel_Op or
+               Op == #Start_Parallel_Call_Op);
+            const Is_Block_Op := (Op == #Start_Parallel_Op or
+               Op == #Add_Parallel_Op);
+            const Tcb_Is_Local :=
+               Base(Instr.Parallel_Control()) == Local_Area;
+
+            //  llvm identifiers
+            const Master      := "%_master"      | I;
+            const Control     := "%_control"     | I;
+            const Static_Link := "%_static_Link" | I;
+
+            Get_Locator_Ptr(Instr.Parallel_Master(), Master, UID_Extra => 1);
+            const Instr_PSL := Instr.Parallel_Static_Link();
+            const SL_Base := Base(Instr_PSL);
+            const SL_Offset := Offset(Instr_PSL);
+
+            var Type_Desc_To_Use :
+               optional Reflection::Type_Descriptor := null;
+
+            //  Declare variables that will be parameters to the
+            //  call on _psc_execute_...
+            var Code_Name : String;
+            var Code_Type : String;
+            var Indirect : Bool := #false;
+            var Execute : String;
+            var Uses_Queuing : Bool := #false;
+            const Internal_Precond_Type := "i32(i64*, i64*, i64*)*";
+            var Internal_Precond_Name := "null";
+
+            var CT_Base : Reflection::Object_Locator::Area_Base_Indicator;
+            var CT_Offset : Reflection::Offset_Within_Area;
+            var Routine : optional Reflection::Routine := null;
+
+            if Is_Block_Op then
+               const Block_Desc := Instr.Parallel_Code_Block();
+               const Internal_Precond := Operation_Routine.Internal_Precond();
+               const Is_Internal_Precond :=
+                 Internal_Precond not null and then
+                   Block_Desc == Internal_Precond;
+               Uses_Queuing := Block_Desc.Uses_Queuing;
+               Code_Name := '@' | LL.Get_Block_Name(I + Block_Desc.Pc_Offset,
+                  Is_Internal_Precond);
+               Code_Type := "i32(i64*, i64*, i64*)*";
+               Execute := "void @_psc_execute_compiled_parallel_op";
+            else
+               const Target := Instr.Parallel_Call_Target();
+               CT_Base := Base(Target);
+               CT_Offset := Offset(Target);
+               const Routine_TDesc := Routine_And_TDesc_For_Call
+                  (Target, Instr_PSL);
+
+               Type_Desc_To_Use := Routine_TDesc.Second;
+               const Routine_To_Call := Routine_TDesc.First;
+               Routine := Routine_To_Call;
+
+               if Routine is null then
+                  //  Determine Routine from target index
+                  Routine := Routine_At_Index(Instr.Parallel_Target_Index());
+               end if
+
+               if Routine_To_Call is null then
+                  //  Name is not compile time known, Go indirect
+                  Indirect := #true;
+                  Execute :=
+                     "void @_psc_execute_compiled_indirect_parallel_call_op";
+               else
+                  //   Name is compile time known, Go direct
+                  Code_Name := Get_Name(Routine);
+
+                  //  If queued, need to pass Internal_Precond
+                  if Instr.Parallel_Is_Queued_Call() and
+                     Routine.Built_In_Desig() is null
+                  then
+                     Internal_Precond_Name :=
+                        //  The integer parameter is ignored if
+                        //  Internal_Precond is #true. So, just pass zero
+                        LL.Get_Block_Name(0, #true, Code_Name);
+                     //  Declare the internal precondition
+                     //  because it may not be in this file
+                     LL.Declare("i32 " | Internal_Precond_Name |
+                        "(i64*, i64*, i64*)");
+                  end if
+
+                  Code_Type := "void(i64*, i64*, i64*)*";
+                  Execute := "void @_psc_execute_compiled_parallel_call_op";
+                  LL.Declare("void " | Code_Name | "(i64*, i64*, i64*)");
+               end if
+
+            end if
+
+            //  Get Type descriptor or uplevel pointer from Static Link Locator
+            if SL_Base == Zero_Base or SL_Base == Type_Area or
+               SL_Base in Enclosing_Type_Areas then
+               Get_Type_Desc(Instr_PSL, Static_Link, Type_Desc_To_Use);
+            else
+               Get_Locator_Ptr(Instr_PSL, Static_Link, UID_Extra => 3);
+            end if
+            
+            //  Get flag values
+            const Is_Start_Flag := Is_Start_Op? 1 : 0;
+            const Tcb_Is_Local_Flag := Tcb_Is_Local? 1 : 0;
+
+            //  Set up TCB and parameter area
+            Setup_Params_For_Call(Routine, Control, Is_Parallel => #true,
+              UID_Extra => 2);
+
+            //  Call out-of-line to Spawn thread etc.
+            LL.Declare(Execute | "(i64*, i64*, i64*, " |
+               (Indirect? "i16, i16" : Code_Type) | ", i64* " |
+               (Indirect? ", i16, i16" : 
+                Is_Block_Op? "" : ", " | Internal_Precond_Type) | 
+               (Is_Block_Op? ", i1" : "") |
+               ", i1, i1" | (Is_Block_Op? ")" : ", i8)"));
+            LL |= "call " | Execute | "(i64* %_Context, i64* " | Master |
+               ", i64* " | Control | ", " |
+               (Indirect? "i16 " | CT_Base | ", i16 " | CT_Offset :
+                  Code_Type | " " | Code_Name) | ", i64* " | Static_Link |
+               (Indirect? ", i16 " | SL_Base | ", i16 " | SL_Offset :
+                Is_Block_Op? "" :
+                  ", " | Internal_Precond_Type | " " | Internal_Precond_Name) |
+               (Is_Block_Op? (", i1 " | Uses_Queuing - #false) : "") |
+               ", i1 " | Tcb_Is_Local_Flag | ", i1 " |
+               Is_Start_Flag | (Is_Block_Op? ")" : ", i8 " |
+                  Instr.Parallel_Locked_Param_Info() | ")");
+           
+            //  Retrieve output parameter, if any
+            Finish_Params_After_Call(Routine, Control, Is_Parallel => #true)
+
+         [#Prepare_To_Exit_Parallel_Op] =>
+            //  Assign unique identifiers
+            const First_Exit := "%_first_exit" | I;
+            const Master     := "%_master"     | I;
+
+            //  Hand labels
+            const Next_Instr := LL.Add_Label(0);
+            const Exit_Now   := "_exit_now"    | I;
+
+            //  Get argument
+            Get_Locator_Ptr(Instr.Parallel_Master(), Master);
+
+            //  Call out-of-line
+            const Execute := "i1 @_psc_execute_prepare_to_exit_parallel_op";
+            LL.Declare(Execute | "(i64*, i64*)");
+            LL |= First_Exit | " = call " | Execute | "(i64* %_Context" | 
+               ", i64* " | Master | ")";
+            
+            //  If this thread is first to Prepare_To_Exit, then continue
+            //  running, otherwise exit now (with "normal" outcome).
+            LL |= "br i1 " | First_Exit | ", label " | Next_Instr | //  True
+                                          ", label %" | Exit_Now;   //  False
+            LL |= Exit_Now | ":";
+
+            Finalize_If_Needed(LL, I, Uses_Rgn);
+
+            //  (Level_Diff => 0, Skip => 0) == 0
+            LL |= "ret i32 0";
+         [#Wait_For_Parallel_Op] =>
+            //  Assign identifiers and get arguments
+            const Master := "%_master" | I;
+            const Level_Skip := "%_level_skip" | I;
+            Get_Locator_Ptr(Instr.Parallel_Master(), Master, UID_Extra => 1);
+
+            //  Go out-of-line to wait
+            const Execute := "i32 @_psc_execute_wait_for_parallel_op";
+            LL.Declare(Execute | "(i64*, i64*)");
+            LL |= Level_Skip | " = call " | Execute | 
+               "(i64* %_Context, i64* " | Master | ")";
+
+            //  If level diff not zero, return
+            Continue_If_Level_Diff_Zero(Level_Skip);
+            
+         [#Create_Lock_For_Obj_Op] =>
+            const Obj_Virt_Ptr := "%_obj_virt_ptr" | I;
+            const Obj_Virt     := "%_obj_virt"     | I;
+            Load_Via_Locator
+              (Instr.Destination(), Obj_Virt_Ptr, Obj_Virt);
+
+            //  Create Lock uses Virtual addresses
+            const Execute := "void @_psc_create_lock_for_obj";
+            LL.Declare(Execute | "(i64*, i64)");
+            LL |= "call " | Execute | "(i64* %_Context, i64 " | Obj_Virt | ")";
+         [#Create_Tcb_Op] =>
+            //  Assign llvm identifiers and get arguments
+            const Master  := "%_master"  | I;
+            const Control := "%_control" | I;
+            const Tcb_Ptr := "%_tcb_ptr" | I;
+            const Tcb := "%_tcb" | I;
+            Get_Locator_Ptr(Instr.Parallel_Master(), Master, UID_Extra => 2);
+
+            //  Call _psc_new_tcb
+            LL.Declare("i64* @_psc_new_tcb(i64*, i64*, i64)");
+            LL |= Tcb_Ptr | " = call i64* @_psc_new_tcb(i64* %_Context, i64* "
+                          | Master | ", i64 " | Instr.Num_Params() | ")";
+            LL |= Tcb | " = ptrtoint i64* " | Tcb_Ptr | " to i64";
+
+            Store_Via_Locator
+              (Instr.Parallel_Control(), Control, Tcb, UID_Extra => 1);
+
+         [#Create_Polymorphic_Obj_Op] =>
+            const Src_Ptr  := "%_src_ptr"  | I;
+            const Rgn_Ptr  := "%_rgn_ptr"  | I;
+            const Dest_Ptr := "%_dest_ptr" | I;
+            const Desc_Ptr := "%_desc" | I;
+            //  Get region from source
+            Get_Locator_Ptr(Instr.Source(), Src_Ptr, UID_Extra => 0);
+            const Get_Region := "i64* @_psc_stg_rgn_of_existing_large_obj";
+            LL.Declare(Get_Region | "(i64*, i64*)");
+            LL |= Rgn_Ptr | " = call " | Get_Region | "(i64* %_Context, " | 
+               "i64* " | Src_Ptr | ")";
+
+            //  Get destination and type descriptor
+            Get_Locator_Ptr(Instr.Destination(), Dest_Ptr, UID_Extra => 1);
+            Get_Type_Desc(Instr.Type_Info(), Desc_Ptr);
+            const Execute := "void @_psc_create_polymorphic_obj";
+            LL.Declare(Execute | "(i64*, i64*, i64*, i64*)");
+            LL |= "call " | Execute | "(i64* %_Context, i64* " | Rgn_Ptr |
+               ", i64* " | Dest_Ptr | ", i64* " | Desc_Ptr | ")";
+
+         [#Unwrap_Polymorphic_Obj_Op] =>
+            const Dest_Ptr       := "%_dest_ptr"       | I;
+            const TDesc          := "%_tdesc" | I;
+            const Source_TDesc   := "%_source_tdesc"   | I;
+            const Source_Ptr     := "%_source_ptr"     | I;
+            const Source         := "%_source"         | I;
+
+            //  Get arguments
+            Get_Locator_Ptr(Instr.Destination(), Dest_Ptr, UID_Extra => 0);
+            Get_Type_Desc(Instr.Source_Type_Info(), Source_TDesc,
+              UID_Extra => 0);
+            Get_Type_Desc(Instr.Type_Info(), TDesc, UID_Extra => 1);
+            Load_Via_Locator
+              (Instr.Source(), Source_Ptr, Source, UID_Extra => 1);
+
+            //  Pass to out-of-line routine
+            const Unwrap := "void @_psc_unwrap_polymorphic_obj";
+            LL.Declare(Unwrap | "(i64*, i64*, i64*, i64)");
+            LL |= "call " | Unwrap | "(i64* " | Dest_Ptr | ", i64* " |
+               Source_TDesc | ", i64* " | TDesc | ", i64 " | Source | ")";
+         [#Select_Polymorphic_Ancestor_Part_Op |
+          #Select_Ancestor_Part_Op] =>
+            const Poly :=
+               Opcode(Instr) == #Select_Polymorphic_Ancestor_Part_Op;
+
+            //  Assign unique identifiers
+            const Dest_Ptr       := "%_dest_ptr"       | I;
+            const Source_Ptr     := "%_source_ptr"     | I;
+            const Source         := "%_source"         | I;
+            const Ancestor_TDesc := "%_ancestor_tdesc" | I;
+            const Source_TDesc   := "%_source_tdesc"   | I;
+
+            //  These two are independent of Poly and Lvalue
+            Get_Locator_Ptr(Instr.Destination(), Dest_Ptr, UID_Extra => 0);
+            Get_Type_Desc(Instr.Type_Info(), Ancestor_TDesc, UID_Extra => 0);
+
+            Get_Locator_Ptr(Instr.Source(), Source_Ptr,
+               UID_Extra => 1);
+            const Get_Poly := "i64* @_psc_get_large_obj_type_descriptor";
+            if Instr.Ancestor_Lvalue() then
+               if Poly then
+                  //  Get Source_TDesc from large object
+                  const Source_Val := "%_source_val" | I;
+                  LL |= Source_Val | " = load i64* " | Source_Ptr;
+                  LL.Declare(Get_Poly | "(i64)");
+                  LL |= Source_TDesc | " = call " | Get_Poly | "(i64 " |
+                     Source_Val | ")";
+               else
+                  Get_Type_Desc(Instr.Source_Type_Info(), Source_TDesc,
+                    UID_Extra => 1);
+               end if
+               //  Pass in the pointer as an int
+               LL |= Source | " = ptrtoint i64* " | Source_Ptr |
+                  " to i64";
+            else
+               //  Get the source value
+               LL |= Source | " = load i64* " | Source_Ptr;
+               if Poly then
+                  //  Get Source_TDesc from large object
+                  LL.Declare(Get_Poly | "(i64)");
+                  LL |= Source_TDesc | " = call " | Get_Poly | "(i64 " |
+                     Source | ")";
+               else
+                  Get_Type_Desc(Instr.Source_Type_Info(), Source_TDesc,
+                    UID_Extra => 1);
+               end if
+            end if
+
+            //  Call the out-of-line function
+            const Select := "void @_psc_select_ancestor_part";
+            LL.Declare(Select | "(i64*, i64*, i64, i64*, i64*, i1)");
+            LL |= "call " | Select | "(i64* %_Context, i64* " | Dest_Ptr |
+               ", i64 " | Source | ", i64* " | Ancestor_TDesc | ", i64* " |
+               Source_TDesc | ", i1 " | (Instr.Ancestor_Lvalue()? 1 : 0) | ")";
+         [#If_Op] =>
+            //  Compute Label locations
+            const True := LL.Add_Label(0);
+            const False := LL.Add_Label(Instr.Skip_If_False());
+
+            //  Name local variables for this instruction
+            const Source_Ptr   := "%_if_source_ptr"   | I;
+            const Source_Val   := "%_if_source_val"   | I;
+            const Shifted      := "%_shifted"         | I;
+            const And          := "%_and"             | I;
+            const Source_Trunc := "%_if_source_trunc" | I;
+
+            //  output LLVM code
+            Load_Via_Locator
+              (Instr.If_Source(), Source_Ptr, Source_Val, UID_Extra => 1);
+            LL |= Shifted | " = shl i64 1, " | Source_Val;
+            LL |= And | " = and i64 " | Shifted | ", " |
+               To_Rep(Instr.If_Condition())
+            LL |= Source_Trunc | " = icmp ne i64 " | And | ", 0";
+            LL |= "br i1 " | Source_Trunc | ", label " | True |
+                                            ", label " | False;
+         [#Call_Nested_Block_Op | #Check_Nested_Block_Op] =>
+            //  Call_Nested_Block not yet used. 
+            const Block_Desc := Instr.Code_Block();
+            if Block_Desc not null and not Instr.Proved() then
+               //  Name llvm identifiers
+               const Skip_Level       := "%_Skip_Level" | I;
+               const Call_Static_Link := "%_call" | I | "_Static_Link";
+               const Call_Param_Area  := "%_call" | I | "_Param_Area";
+
+               //  Get arguments
+               const SL_Base := Base(Instr.Static_Link());
+               if SL_Base == Zero_Base or SL_Base == Type_Area or
+                  SL_Base in Enclosing_Type_Areas then
+                  Get_Type_Desc(Instr.Static_Link(), Call_Static_Link);
+               else
+                  Get_Locator_Ptr(Instr.Static_Link(), Call_Static_Link,
+                          UID_Extra => 1);
+               end if
+               Get_Locator_Ptr(Instr.Params(), Call_Param_Area, 
+                          UID_Extra => 2);
+
+               //  Call the block function
+               const Internal_Precond := Operation_Routine.Internal_Precond();
+               var Matches : Bool := #false;
+               if Internal_Precond not null then
+                  Matches := Block_Desc == Internal_Precond;
+               end if
+               const Block_Name := LL.Get_Block_Name(I + Block_Desc.Pc_Offset,
+                  Matches);
+               LL |= Skip_Level | " = call i32 @" | Block_Name |
+                  "(i64* %_Context, i64* " | Call_Param_Area | ", i64* " |
+                  Call_Static_Link | ")";
+
+               if Opcode(Instr) == #Check_Nested_Block_Op then
+                  const Assert          := "%_assert"         | I;
+                  const Assert_Trunc    := "%_assert_trunc"   | I;
+                  
+                  //  Create Labels
+                  const Fail            := "_fail"            | I;
+                  const Next := LL.Add_Label(0);
+
+                  //  Check assertion value and branch
+                  LL |= Assert | " = load i64* " | Call_Param_Area;
+                  LL |= Assert_Trunc | " = icmp eq i64 " | Assert | ", 1";
+                  LL |= "br i1 " | Assert_Trunc | ", label " | Next | //  True
+                                                  ", label %" | Fail; // False
+                  LL |= Fail | ":";
+                  Runtime_Message(Source_Pos(Instr) |
+                    ": Error: Assertion failed: " |
+                     Instr.Assertion_Str() | '\n');
+                  LL |= "br label " | Next;
+               else
+                  //  we may need to exit as well
+                  Continue_If_Level_Diff_Zero(Skip_Level);
+               end if
+
+            else
+               var IO := IO::Get_IO();
+               IO.Stderr.Println(
+                  Instr.Source_Pos() | 
+                  " Internal: Attempted to call or check null Nested_Block");
+               {#false};
+            end if
+         [#Begin_Nested_Block_Op] =>
+            //  Notify printer of location of beginning of nested block
+            //  Always preceded by a Return_Op or Exit_Op
+            const Block_Desc := Instr.Nested_Code_Block();
+            const Internal_Precond := Operation_Routine.Internal_Precond();
+            var Matches : Bool := #false;
+            if Internal_Precond not null then
+               Matches := Block_Desc == Internal_Precond;
+            end if
+            LL.Begin_Nested_Block_Op(Block_Desc.Pc_Offset, 
+               (Block_Desc.Start_Callee_Locals, Block_Desc.Uses_Stg_Rgn, 
+                Block_Desc.Nesting_Level, Line(Source_Pos)),
+                Matches);
+
+            if VN_IL not null then
+               //  No VNs are initialized at start of a nested block
+               VN_IL.Start_Nested_Block();
+            end if
+
+         [#Check_Not_Null_Op] =>
+            //  Send a fail message if it is null
+            if Run_Time_Checks and not Instr.Proved() then
+               const Arg        := "%_arg"        | I;
+               const Arg_Ptr    := "%_arg_ptr"    | I;
+               const Result     := "%_result"     | I;
+               const Result_Ext := "%_result_ext" | I;
+               const Result_Ptr := "%_result_ptr" | I;
+               const Desc       := "%_desc"       | I;
+               Load_Via_Locator
+                 (Instr.Destination(), Arg_Ptr, Arg, UID_Extra => 1);
+               Get_Type_Desc(Instr.Null_Type_Info(), Desc);
+               LL.Declare("i1 @_psc_is_null_value(i64, i64*)");
+               LL |= Result | " = call i1 @_psc_is_null_value(i64 " | Arg
+                  | ", i64* " | Desc | ")";
+               const Next := LL.Add_Label(0);
+               const Fail := "_fail" | I;
+               LL |= "br i1 " | Result | ", label %" | Fail | //  True
+                                         ", label " | Next;   //  False
+               LL |= Fail | ":";
+               Runtime_Message(Source_Pos(Instr) |
+                  ": Error: Null value not permitted here: \n");
+            end if
+         [..] =>
+            var IO := IO::Get_IO();
+            IO.Stderr.Println(
+               Instr.Source_Pos() | 
+               " Internal: Unrecognized PSVM Opcode " | Opcode(Instr));
+            {#false};
+      end case
+
+      if VN_IL not null then
+         Flush_VNs_If_Necessary(#after)
+      end if
+
+      //  Bump the PC according to the number of PSVM instructions processed
+      for Offset in 0 .. Look_Ahead_Count loop
+         LL.Next_PSIR_Instr();
+      end loop
+   end func Compile_One_Instr
+
+   //  Compile the declaration if it resides in the given source file
+   func Compile_One_Decl(var LL : LLVM_Printer; File_Name : String;
+      Item : Reflection::Decl) -> Int is
+
+      if Item is null or else
+         (Context(Item) == #inherited or
+          Kind(Item) == #type or
+         (Kind(Item) == #operation
+            and then Operation_Equiv_To(Item) not null) or
+          File(Decl_Source_Pos(Item)) != File_Name) then
+         //  Do nothing for inheriteds, types, equiv_tos and
+         //  Declarations in other files
+         return 0;
+      end if
+
+      var Count := 0;
+
+      const Region := not Is_Spec(Item) and Kind(Item) == #operation?
+                      Body_Region(Item) : Decl_Region(Item)
+      if not Is_Spec(Item) and Kind(Item) == #module then
+         const Spec := Spec(Item);
+         if File(Decl_Source_Pos(Spec)) == File(Decl_Source_Pos(Item)) then
+            //  This prevents double defining when interface and class
+            //  are in the same file
+            return Count;
+         end if
+      end if
+
+      //  Iterate through all items in this region
+      //  And call Compile_One_Decl on each
+      func Recurse_On_Region(R : Reflection::Region) is
+         for I in 1 .. Num_Items(R) forward loop
+            const Next_Item := R.Nth_Item(I);
+            if Verbose_Debug then
+               const This_Mod := Module_Name(Item);
+               if Next_Item not null then
+                  Println("Recursing from " |
+                     To_String(Kind(Item)) | " " |
+                     (This_Mod is null? "" : This_Mod | "::") |
+                     Id(Item) | " to " |
+                     To_String(Kind(Next_Item)) | " " |
+                     (Module_Name(Next_Item) is null? ""
+                        : Module_Name(Next_Item) | "::") |
+                     (Id(Next_Item) is null? "null" : Id(Next_Item)));
+               end if
+            end if
+            Count += Compile_One_Decl(LL, File_Name, R.Nth_Item(I));
+         end loop
+      end func Recurse_On_Region
+
+      //  Recurse on this region, its nested region, and siblings.
+      func Recurse_On_Nested_Regions(R : Reflection::Region) is
+         if R not null then
+            Recurse_On_Region(R);
+            case Kind(R) of
+               [#Module_Region_Kind | #Operation_Param_Region_Kind] =>
+                  //  We don't need to recurse on the nested regions
+                  //  because that is implicit in processing the nested
+                  //  items.
+                  null
+
+               [..] =>
+                  //  Recurse on the nested regions, because these aren't
+                  //  necessarily reached from the items of the current region.
+                  for I in 1 .. Num_Nested_Regions(R) forward loop
+                     const Nested := R.Nth_Nested_Region(I);
+                     if Nested not null then 
+                        Recurse_On_Nested_Regions(Nested);
+                        
+                        var Sibling := Sibling_Region(Nested);
+                        while Sibling not null loop
+                           Recurse_On_Nested_Regions(Sibling);
+                           Sibling := Sibling_Region(Sibling);
+                        end loop;
+                     end if
+                  end loop
+            end case
+         end if
+      end func Recurse_On_Nested_Regions
+
+      Recurse_On_Nested_Regions(Region);
+
+      case Kind(Item) of
+         [#object] =>
+            const Val := Value_Of_Global_Const(Item);
+            if Val not null then
+               const Const_Name := Make_Link_Name(Module_Name(Item) | "::" |
+                 Id(Item));  //  surrounds with "...", so need to strip off
+               LL.Add_Constant(Const_Name[1 <..< |Const_Name|], Val);
+               const Const_Type_Index := LL.PFT.Get_Local_Index
+                 (Const_Info_For_Value(Val).Data.Type_Desc);
+                  //  Get type desc to ensure it exists for reconstruct value
+               Count += 1
+            end if
+         [#operation] => 
+            if Is_Spec(Item) then
+               //  operation specs have no code
+               return Count;
+            end if
+
+            if Compile_Operation(LL, Item) then
+               Count += 1
+            end if
+            Count += 1;
+         [..] => null;
+      end case;
+      return Count;
+   end func Compile_One_Decl
+
+   func Init_One_Const
+     (var LL        : LLVM_Printer;
+      var Init_Func : String;
+      Is_Internal   : Boolean;
+      Const_Val     : Reflection::Streamable_Value;
+      Const_Name    : String;
+      Const_Size    : Int;
+      UID           : Int) is
+   //  Initialize one named or anonymous compile-time-known constant
+   //  Add LLVM code to LL and to Init_Func, according to whether
+   //  is a declaration (add to LL) or initialization code (add to Init_Func).
+   //  Is_Internal is True if this is an internal object, as opposed to an
+   //  externally visible object.
+   //  Const_Val is the streamable value for the constant
+   //  Const_Name is the name to use for the declared object
+   //  Const_Size is the size of the stream used to represent a large constant
+   //  UID is a uniquifying integer for use in LLVM variables
+
+      //  See whether we have a small or string value
+      const Info := Const_Info_For_Value (Const_Val);
+      const Const_Locator := Const_Value_Locator (Const_Val);
+      const Const_Annotation := Name_For_Object_Locator (Const_Locator);
+      const Type_Of_Const := Info.Data.Type_Desc;
+      const Val       := "%_const_val_" | UID;
+      const Str_Ptr   := "%_const_str_ptr" | UID;
+      const Global_Name := "@\"" | Const_Name | '"';
+      const Univ_Integer_Null_Value := "-9223372036854775808";
+      const Intern_Str := (Is_Internal? "internal " : "");
+
+      if Is_Small(Type_Of_Const) then
+         { Const_Size == 0 }
+
+         //  NOTE: Univ_Enums need special handling
+         if Type_Kind(Type_Of_Const) == #univ_enum then
+            //  Declare an internal variable
+            LL |= Global_Name | " = " | Intern_Str |
+              "global i64 0; " | Const_Annotation;
+
+            //  Initialize it in the Init_Func
+            const Orig_Num_Strs := LL.PFS.Num_Elems();
+            const Str_Index := LL.PFS.Get_Local_Index (To_String
+              (Reflection::Interpret_As_Univ_Enum (Info.Data.Value)));
+            if Debug_Strings
+              and then LL.PFS.Num_Elems() > Orig_Num_Strs
+            then
+               Println("Univ_Enum const: #" | Str_Index | " is " |
+                 LL.PFS.Nth_Elem (Str_Index));
+            end if;
+            Init_Func |= Ind | Str_Ptr | " = getelementptr i64* " | 
+               "%_Str_Tab, i64 " | Str_Index-1 | '\n';
+            Init_Func |= Ind | Val | " = load i64* " | Str_Ptr | '\n';
+
+            Init_Func |=
+              Ind | "store i64 " | Val | ", i64* " | Global_Name | '\n';
+         elsif Info.Data.Value is null then
+            //  Value matches Univ_Integer null value
+            LL |= Global_Name | " = " | Intern_Str | "constant i64 " |
+                             Univ_Integer_Null_Value | "; " | Const_Annotation;
+         else
+            //  Small value can be used as is
+            LL |= Global_Name | " = " | Intern_Str | "constant i64 " |
+                             Info.Data.Value | "; " | Const_Annotation;
+         end if
+      elsif Type_Kind(Type_Of_Const) == #univ_string then
+         //  Treat like the Store_Str_Lit operation, but create
+         //  string literal in the global data area.
+         { Const_Size == 0 }
+
+         //  Declare an internal variable
+         LL |= Global_Name | " = " | Intern_Str | "global i64 0; " |
+           Const_Annotation;
+
+         //  Need to interpret Info.Data.Value as a Univ_String
+         const Str_Val := Reflection::Interpret_As_String(Info.Data.Value);
+
+         const Orig_Num_Strs := LL.PFS.Num_Elems();
+         const Str_Index := LL.PFS.Get_Local_Index(Str_Val);
+         if Debug_Strings and then LL.PFS.Num_Elems() > Orig_Num_Strs then
+            Println("Univ_String const: #" | Str_Index | " is " |
+              Str_Val);
+         end if;
+
+         const Str_Id_Val := "%_str_id_val" | UID;
+
+         //  Now load run-time string id
+         Init_Func |= Ind | Str_Ptr | " = getelementptr i64* " | 
+            "%_Str_Tab, i64 " | Str_Index-1 | '\n';
+         Init_Func |= Ind | Str_Id_Val | " = load i64* " | Str_Ptr | '\n';
+
+         //  Now call run-time routine to turn the string id into a
+         //  global string value.
+
+         LL.Declare("i64 @_psc_global_str_lit(i64)");
+         Init_Func |= Ind | Val |
+            " = call i64 @_psc_global_str_lit(i64 " | Str_Id_Val | ")\n";
+
+         Init_Func |=
+           Ind | "store i64 " | Val | ", i64* " | Global_Name | '\n';
+      else
+         //  Large, non-string value; use out-of-line reconstruction routine
+         if Const_Size <= 0 then
+            Println ("** Init_One_Const: Const_Name = " | Const_Name |
+               ", Const_Size = " | Const_Size |
+               ", Const_Annotation = " | Const_Annotation |
+               ", Type = " | Name (Type_Of_Const));
+         end if
+
+         { Const_Size > 0 }
+
+         //  Declare an internal variable
+         LL |= Global_Name | " = " | Intern_Str | "global i64 0; " |
+           Const_Annotation;
+
+         const Recon := "%_recon_" | UID;
+         const Cast := "%_cast_" | UID;
+         Init_Func |= Ind | Cast | " = bitcast ["|
+            Const_Size | " x i8]* @\"" | Const_Name | "$stream\" to i8*\n";
+         Init_Func |= Ind | Recon | " = call " | Recon_Value_Func | 
+            "(i8* " | Cast | ", i64* %_Str_Tab)\n";
+         Init_Func |= Ind | "store i64 " | Recon |
+            ", i64* " | Global_Name | '\n';
+      end if
+   end func Init_One_Const
+
+ exports
+
+   //  Compile one operation; return #true if compile succeeded
+   //  return #false if compile skipped because code already produced
+   func Compile_Operation(var LL : LLVM_Printer; Item : Reflection::Decl)
+     -> Boolean is
+      const Routine := Routine_For_Operation(Item);
+
+      // Compute name
+      const Module_Name := Reflection::Routine::Module_Name(Routine);
+      var Op_Name := Id(Item);
+
+      //  Check if this might be main
+      const Params := Parameters(Routine);
+      var Possible_Type := 
+        "PSL::Containers::Basic_Array<PSL::Core::Univ_String>";
+      //  One Parameter of type Basic_Array<Univ_String> and, no return
+      const Args_Match_Main :=
+         |Params| == 1 and then 
+         (not Params[First(Params)].Is_Operation_Output and
+         Params[First(Params)].Type_Name == Possible_Type);
+
+      var Full_Name := Op_Name;
+      if Module_Name not null and then Module_Name != "" then
+         Full_Name := Module_Name | "::" | Op_Name;
+      elsif Args_Match_Main and Op_Name == "main" then
+         //  main must be a top-level function
+         //  not nested within a module
+         //  And therefore, can't be overloaded
+         Op_Name := "_parasail_main_routine";
+         Full_Name := Op_Name;
+      end if
+
+      //  For overloading
+      const Homonyms := Num_Prior_Homonyms(Item);
+      Full_Name := Make_Link_Name (Full_Name, Homonyms);
+
+      //  For registering compiled routine
+      //  Do not use Linker substitutions on Op_Name or Module_Name
+      const Register_Op_Name : String :=
+        Name_With_Overloading_Index(Routine);
+
+      LL.Add_Module_Op(Module_Name, Register_Op_Name, '@' | Full_Name,
+         Has_Internal_Precond => Routine.Internal_Precond() not null,
+         Uses_Queuing         => Routine.Uses_Queuing());
+
+      if Verbose_Debug and then |Params| == 1
+        and then not Params[First(Params)].Is_Operation_Output
+      then
+         Println ("First param type = " |
+           Params[First(Params)].Type_Name);
+      end if
+
+      if LL.Has_Func(Full_Name) then
+         //  Prevent double definition
+         return #false
+      end if
+
+      var VN_IL : optional PSC::VN_IL_Type := (Use_VN_IL? Analyze(Item) : null)
+        //  Use ParaScope to produce VN-based Intermediate Language
+
+      const Line_Number := Line(Decl_Source_Pos(Item));
+      if Verbose_Debug then
+         Println ("Begin function " | Full_Name |
+           " at line " | Line_Number)
+      end if
+      LL.Begin_Function(Full_Name, Routine.Frame_Size(),
+         Routine.Uses_Stg_Rgn(), Line_Number, Context(Item) == #local);
+
+      var Look_Ahead_Count := 0;
+
+      //  Compile intructions in this routine
+      for I in 1 .. Routine.Num_Instrs() forward loop
+         if Look_Ahead_Count > 0 then
+            //  Skipping this instruction, because code for it was
+            //  generated when processing a prior instruction
+            Look_Ahead_Count -= 1;
+         else
+            //  No look-ahead was performed
+            Compile_One_Instr(Routine, LL, I, VN_IL, Look_Ahead_Count);
+         end if;
+      end loop
+
+      //  A basic block without a terminating instruction is illegal llvm
+      //  PSVM doesn't have this requirement, so we need to
+      //  look for any basic block without terminating instr
+      //  and add in a "noop br" (break to next line)
+      const Terminators : Set<Reflection::Instruction::Opcode_Enum> :=
+            #If_Op | #Skip_Op | #Return_Op | #Exit_Op |
+            #Call_Nested_Block_Op | #Check_Nested_Block_Op |
+            #Wait_For_Parallel_Op | #Prepare_To_Exit_Parallel_Op;
+      const First := Routine.Nth_Instr(1);
+
+      //  Special case: first instruction
+      if LL.Has_Label(1 .. 1) then
+         const To_Add : String := Ind | "br label %_lbl1\n\n";
+         const As_Vec : ZVector<String> := [To_Add];
+         const New_Instr := LL.Peek(0) | As_Vec;
+         LL.Edit(0, New_Instr);
+      end if
+
+      //  Iterate through the rest
+      for I in 1 .. Routine.Num_Instrs() - 1 forward loop
+         const Curr_Instr := Routine.Nth_Instr(I);
+         const Next := I + 1;
+         if LL.Has_Label(Next .. Next) and
+            Opcode(Curr_Instr) not in Terminators then
+            const To_Add : String :=
+               Ind | "br label %_lbl" | Next | "\n\n";
+            var New_Instr : ZVector<String> := LL.Peek(I);
+            New_Instr |= To_Add;
+            LL.Edit(I, New_Instr);
+         end if
+      end loop
+
+      //  Done compiling this function
+      if Verbose_Debug then
+         Println ("End function " | Full_Name)
+      end if;
+      LL.End_Function();
+
+      return #true  //  Success
+   end func Compile_Operation
+
+   func Compile(File_Name : String; LLVM_Debug, Optimize : Bool) is
+      //  Compile the code (if any) in the file named File_Name
+      var LL : LLVM_Printer := Create(Indent, LLVM_Debug, Optimize);
+
+      var Env := Reflection::Environment::Get_Current_Env()
+
+      var Count := 0;
+
+      //  Compile all the Declarations that are defined in File_Name
+      for I in 1 .. Env.Num_Library_Items() forward loop
+         const Item := Env.Nth_Library_Item(I);
+        
+         //  Compile_One_Decl will recurse on the regions within Item
+         Count += Compile_One_Decl(LL, File_Name, Item)
+      end loop
+
+      if Debug then
+         Println(" Begin initialization code for " | File_Name)
+      end if
+
+      //  Tell the printer to put the following code at the top,
+      //  instead of in a function
+      LL.Begin_Top_Of_File_Initializations();
+
+      //  Code added to the LLVM_Printer after the last instruction will
+      //  be put at the top of the file
+
+      var Init_Func_Hdr := "define internal void @$initialize_streams() {\n";
+      //  The per-file initialization routine header (will also have
+      //  call on reconstruct_strings if it is used)
+
+      var Init_Func := ""
+      //  Rest of per-file initialization routine
+      //  Init_Func initializes all the streamed
+      //  Constants, Type_Descriptors, Univ_Enumerations, and Strings
+
+      if Debug then
+         Println (" Emit " | LL.PFT.Num_Elems() | " type descriptors for " |
+           File_Name)
+      end if
+
+      if LL.PFT.Num_Elems() > 0 then
+         //  Output stream data into arrays
+         //  and build table to access those arrays
+         const Descs_Type := "[" | LL.PFT.Num_Elems() | " x i64*]";
+         var Streams : String := 
+            "@$Type_Desc_Streams = internal constant [" |
+            LL.PFT.Num_Elems() | " x i8*] [";
+         var Descs : String := "@$Type_Descriptors = internal global " |
+            Descs_Type | "\n[";
+
+         //  Iterate through the per file Type Descriptor table and stream
+         //  out its contents
+         for (I in 1 .. LL.PFT.Num_Elems(); Sep := "" then ", ") forward loop
+            const Elem := LL.PFT.Nth_Elem(I);
+            const Name := Make_Link_Name(Unique_Name(Elem));
+            const Old := LL.PFS.Num_Elems();
+            const S := Stream(Elem, LL.PFS);
+            const Len := Length(S);
+            if Debug_Strings or Verbose_Debug then
+               Println(File_Name | ": " |
+                 Old | " -> " | LL.PFS.Num_Elems());
+            end if
+            LL |= "@" | Name | " = internal constant [" | // tbd was "linkonce"
+               Len | " x i8] ";
+            LL |= To_String_Vec(S);
+            LL |= "\n";
+            //  Point to corresponding stream
+            Streams |= (Sep | "\n i8* getelementptr ([" | Len |
+               " x i8]* @" | Name | ", i64 0, i64 0)");
+            //  Initialize Descriptors to null
+            if I mod 5 == 0 then
+               Descs |= (Sep | "\n i64* null");
+            else
+               Descs |= (Sep | "i64* null");
+            end if
+         end loop
+         Streams |= "]";
+         Descs |= "]";
+         LL |= Streams;
+         LL |= Descs;
+         LL |= "@$Types = internal constant i64** bitcast (" | Descs_Type | 
+            "* @$Type_Descriptors to i64**)";
+
+         //  call Reconstruct_Type_Descriptors
+         Init_Func |= Ind | "%_desc = load i64*** @$Types\n";
+         LL.Declare("void @_psc_reconstruct_type_descriptors" | 
+            "(i16, i8**, i64*, i64**)");
+         Init_Func |= Ind | "call void @_psc_reconstruct_type_descriptors(i16 "
+            | LL.PFT.Num_Elems() | ", i8** " | 
+            "getelementptr ([" | LL.PFT.Num_Elems() |
+            " x i8*]* @$Type_Desc_Streams, i64 0, i64 0)," |
+            " i64* %_Str_Tab, i64** %_desc)\n";
+
+      end if
+
+      //  Initialize the compile-time constants
+
+      //  Initialize the anonymous constants
+      //  For each anonymous constant, in the Init_Func:
+      //  * If small, non-univ-enum: nothing to do, since we can initialize
+      //      on declaration.
+      //  * If small, univ-enum: we need to include it in the per-file string
+      //      table, and here we copy from the string table into the anon-const
+      //      table.
+      //  * If string: we need to include it in the per-file string table,
+      //      and here we copy it from the string table and make it into
+      //      a univ-string by calling some appropriate function.
+      //  * If large, non-string: reconstruct value on a stream
+
+      //  The anon-const table entry is initialized either with correct value,
+      //  or a small univ-enum null value, or a large null value.
+      //  The per-file string table needs to be augmented for univ-enum
+      //  and univ-string.
+      //  We emit a stream for each non-string large anon constant.
+      //  At run-time we do not iterate through the anon-const table,
+      //  so this "table" can in fact be a set of separate objects, either
+      //  constants if a non-enum small value, or variables, if an enum,
+      //  string, or other large object.  This also means that we can place
+      //  the stream, if any, for the object immediately next to the object
+      //  itself, which will simplify the compiler logic.
+
+      if Debug then
+         Println (" Emit " | LL.PFC.Num_Elems() | " anon consts for " |
+           File_Name)
+      end if
+
+      var Large_Const_Seen : Boolean := #false;
+             //  whether reconstruct-value func will be needed
+
+      for I in 1 .. LL.PFC.Num_Elems() forward loop
+         const Const_Val := LL.PFC.Nth_Elem(I);
+         const Anon_Const_Name := "$Anon_Const_" | I;
+         const Anon_Const_Size :=
+                 LL.Create_Anon_Const_Stream(Anon_Const_Name, Const_Val);
+
+         if Anon_Const_Size > 0 then
+            //  Will need to declare the reconstruct-value function
+            Large_Const_Seen := #true;
+         end if
+
+         Init_One_Const (LL, Init_Func,
+           Is_Internal => #true,
+           Const_Val   => Const_Val,
+           Const_Name  => Anon_Const_Name,
+           Const_Size  => Anon_Const_Size,
+           UID => I)
+      end loop
+
+      //  Gather info on the named constants
+      const Consts := LL.Get_Constants();
+
+      if Debug then
+         Println (" Emit " | |Consts| | " named consts for " |
+           File_Name)
+      end if
+
+      if |Consts| > 0 then
+         //  Outputing streams is handled in the printer
+         //  We just need to call the reconstructor here
+
+         for (each [Name => Size] of Consts;
+              UID := LL.PFC.Num_Elems()+1 then UID+1) loop
+            Init_One_Const(LL, Init_Func,
+              Is_Internal => #false,
+              Const_Val   => LL.Constants[Name],
+              Const_Name  => Name, Const_Size => Size, UID => UID);
+
+            if Size > 0 then
+               Large_Const_Seen := #true;
+            end if
+         end loop
+      end if
+
+      if Large_Const_Seen then
+         //  Declare the reconstruct-value function
+         LL.Declare(Recon_Value_Func | "(i8*, i64*)");
+      end if
+
+      //  Register the compiled operations within this file
+      //  so that the RTS can make indirect calls on them
+      const Indices_Size := LL.Module_Op_Info_Size();
+
+      if Debug then
+         Println (" Register " | Indices_Size | " compiled ops for " |
+           File_Name)
+      end if
+
+      if Indices_Size > 0 then
+         const Func_Type := "void(i64*, i64*, i64*)*";
+         const Block_Type := "i32(i64*, i64*, i64*)*";
+         const Out_Line := "void @_psc_register_compiled_operations";
+         const Num_IPs := LL.Num_Internal_Preconds();
+         //  Signature of Register_Compiled_Operations is: 
+         //  Num_Operations, Operation_Ids, Operation_Addrs
+         //  String_Tab, Num_Internal_Preconds, Internal_Precond_Ops,
+         //  Internal_Precond_Addrs
+         LL.Declare(Out_Line | "(i16, i16*, " | Func_Type | "*, i8*, i64*, " |
+            "i32, i16*, " | Block_Type | "*)");
+         Init_Func |= Ind | "call " | Out_Line | "(i16 " | Indices_Size |
+            ", i16* getelementptr ([" | (Indices_Size * 2) |
+            " x i16]* @$Module_Op_Indices, i64 0, i64 0), " | Func_Type |
+            "* getelementptr ([" | Indices_Size | " x " | Func_Type | "]* " |
+            "@$Local_Funcs, i64 0, i64 0), i8* getelementptr ([" |
+            Indices_Size | " x i8]* @$Local_Funcs_Use_Queuing, i64 0, i64 0),"
+            | " i64* %_Str_Tab, i32 " | Num_IPs |
+            ", i16* getelementptr ([" | Num_IPs |
+            " x i16]* @$Internal_Precond_Indices, i64 0, i64 0), " |
+            Block_Type | "* getelementptr ([" | Num_IPs | " x " | Block_Type |
+            "]* @$Internal_Precond_Blocks, i64 0 , i64 0))\n";
+      end if
+
+      //  NOTE: We put out the string table last, as it might
+      //        be updated as a side effect of streaming out the
+      //        type descriptors or global constants.
+
+      if Debug then
+         Println (" Emit " | LL.PFS.Num_Elems() | " strings for " |
+           File_Name)
+      end if
+
+      if LL.PFS.Num_Elems() > 0 then
+         //  Output stream data for strings into arrays
+         //  and build table to access those arrays
+         const Str_Tab_Type := "[" | LL.PFS.Num_Elems() | " x i64]";
+         var Streams : String := 
+            "@$Str_Streams = internal constant [" |
+            LL.PFS.Num_Elems() | " x i8*] [";
+         var Strs : String := "@$String_Table = internal global " |
+            Str_Tab_Type | " \n[";
+
+         //  Iterate throught the per file String table and stream out
+         //  its contents
+         for (I in 1 .. LL.PFS.Num_Elems(); Sep := "" then ", ") forward loop
+            const S := LL.PFS.Nth_Elem_As_Stream(I);
+            LL |= "@$str_stream" | I | " = internal constant [" |
+               Length(S) | " x i8] ";
+            LL |= To_String_Vec(S);
+            LL |= "\n";
+            //  Point to corresponding stream
+            Streams |= (Sep | "\ni8* getelementptr ([" | Length(S) |
+               " x i8]* @$str_stream" | I | ", i64 0, i64 0)");
+            //  Initialize String_Table to 0s.
+            //  Will be filled in Reconstruct_Strings
+            if I mod 10 == 0 then
+               Strs |= (Sep | "\n i64 0");
+            else
+               Strs |= (Sep | "i64 0");
+            end if;
+         end loop
+         Streams |= "]";
+         Strs |= "]";
+         LL |= Streams;
+         LL |= Strs;
+         LL |= "@$Strings = internal constant i64* bitcast (" | Str_Tab_Type | 
+            "* @$String_Table to i64*)";
+
+         //  Put call on reconstruct_strings at front of Init_Func so
+         //  string table can be used while reconstructing
+         //  other tables.
+         LL.Declare("void @_psc_reconstruct_strings(i16, i8**, i64*)")
+
+         //  Make the call on Reconstruct_Strings
+         Init_Func_Hdr |= Ind | "%_Str_Tab = load i64** @$Strings\n";
+         Init_Func_Hdr |= Ind | "call void @_psc_reconstruct_strings(i16 " |
+            LL.PFS.Num_Elems() | ", i8** " | 
+            "getelementptr ([" | LL.PFS.Num_Elems() |
+            " x i8*]* @$Str_Streams, i64 0, i64 0), i64* %_Str_Tab)\n";
+      else
+         //  Init %_Str_Tab to the null value if no string table
+         Init_Func_Hdr |= Ind | "%_Str_Tab = getelementptr i64* null, i64 0\n";
+      end if
+      
+      if Debug then
+         Println(" Emit initialization func for " | File_Name)
+      end if
+
+      //  Finish the Initialization Function
+      Init_Func |= Ind | "ret void\n}";
+
+      if LL.PFT.Num_Elems() > 0 or else LL.PFS.Num_Elems() > 0 
+        or else |Consts| > 0 or else Indices_Size > 0
+      then
+         //  Global To Do list for initializations
+         //  We cannot just add @$initialize_streams to the constructors list
+         //  because llvm walks the constructor list before the Ada runtime
+         //  is initialized. That is why this todo list is necessary
+         LL |= "@_psc_global_to_do = external global {i64*, void()*}*";
+
+         LL |= (Init_Func_Hdr | Init_Func);
+
+         const Node := "@\"_node_" | Replace(File_Name, '"', '$') | '"';
+         LL |= Node | " = global {i64*, void()*} " | 
+            "{i64* null, void()* @$initialize_streams}";
+
+         //  Add intialize_streams to the to do list
+         LL |= "define internal void @$add_to_todo() {";
+         LL |= Ind | "%_next = load {i64*, void()*}** @_psc_global_to_do";
+         LL |= Ind | "%_nextc = bitcast {i64*, void()*}* %_next to i64*";
+         LL |= Ind | "%_node.next_ptr = getelementptr " | 
+            "{i64*, void()*}* " | Node | ", i32 0, i32 0";
+         LL |= Ind | "store i64* %_nextc, i64** %_node.next_ptr";
+         LL |= Ind | "store {i64*, void()*}* " | Node | ", " | 
+            "{i64*, void()*}** @_psc_global_to_do";
+         LL |= Ind | "ret void";
+         LL |= "}";
+         
+         //  Put the todo list appender into the llvm constructor list
+         //  So it will be called at startup
+         LL |= "@llvm.global_ctors = appending global " | 
+            "[1 x {i32, void ()*}] [{i32, void()*} {i32 65535, void ()* " | 
+            "@$add_to_todo}]";
+
+      end if
+
+      if Count == 0 then
+         //  A pure interface (with no code) will come up empty
+         //  or if someone forgot to load it into the interpreter
+         var IO := IO::Get_IO();
+         IO.Stderr.Println("File not found (or has no executable code): " |
+           File_Name);
+
+         var Empty : File_Output_Stream := Create(IO, File_Name | ".ll");
+         Empty.Println("; File not found (or has no executable code)");
+         Empty.Close();
+      else
+         if Debug then
+            Println (" Dump LLVM for " | File_Name)
+         end if
+
+         LL.Dump(File_Name, File_Name | ".ll");
+      end if
+
+      //  Reclaim internal storage used for the per-file string table
+      Reset(LL.PFS)
+   end func Compile
+end class PSC::Translate;
+
+func Compile(Files : PSL::Containers::Basic_Array<String>) is
+   var LLVM_Debug : Bool := #false;
+   var Optimize : Bool := #false;
+   var Forward : Bool := #false; // concurrent file compilation by default
+
+   //  Analyze flags
+   for each Arg of Files forward loop
+      const Len := Length(Arg);
+      if Arg == "-g" then
+         LLVM_Debug := #true;
+      elsif Arg == "-O" then
+         Optimize := #true;
+      elsif Len == 3 and then (Arg[1 .. 2] == "-O" and Arg[3] != '0') then
+         //  -On where n is not '0' enables optimizations
+         Optimize := #true;
+      elsif Arg == "--forward" then
+         Forward := #true;
+      end if
+   end loop
+
+   //  Can't have both optimization and debugging (for now)
+   if LLVM_Debug and Optimize then
+      var IO := IO::Get_IO();
+      IO.Stderr.Println("Warning: -g and -O given, ignoring -O");
+      Optimize := #false;
+   end if
+
+   //  Compile each file (except for flags)
+   func Loop_Body(F : String) is
+      if Length(F) < 1 or else F[1] == '-' then
+         //  it's it's the empty string or a flag, ignore it
+         return
+      end if
+      if Translate::Debug then
+         Println("Compiling " | F);
+      end if
+      Translate::Compile(F, LLVM_Debug, Optimize)
+      if Translate::Debug then
+         Println("Done " | F);
+      end if
+   end func Loop_Body
+
+   if Forward then
+      for each F of Files forward loop
+         Loop_Body(F);
+      end loop
+   else
+      for each F of Files concurrent loop
+         Loop_Body(F);
+      end loop
+   end if
+
+end func Compile

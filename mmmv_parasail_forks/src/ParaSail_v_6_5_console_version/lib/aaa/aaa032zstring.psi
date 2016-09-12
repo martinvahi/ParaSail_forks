@@ -1,0 +1,181 @@
+interface PSL::Core::ZString<> is
+  // A universal string with characters indexed starting at 0
+    op "from_univ"(Univ : Univ_String) -> ZString
+      is import(#identity)
+    op "to_univ"(ZStr : ZString) -> Univ_String
+      is import(#identity)
+
+    func Print(ZString) is import(#print_string)
+    func Println(ZString) is import(#println_string)
+    func Readln() -> optional ZString is import(#read_string)
+
+    op "*"(Left : Univ_Integer; Right : ZString) -> ZString
+        // Produce specified number of "Right" strings in a row
+    op "*"(Left : ZString; Right : Univ_Integer) -> ZString
+        // Produce specified number of "Left" strings in a row
+
+    op "|"(Left, Right : ZString) -> ZString 
+      is import(#concat_string)
+
+    op "=?"(Left, Right : ZString) -> Ordering
+      is import(#string_compare)
+
+    op "|="(var Left : ZString; Right : ZString)
+      is import(#assign_concat_string)
+
+    op "indexing"(Str : ZString; Index : Univ_Integer<>) -> Univ_Character
+        // a "read-only" element, indexed 0..<Length(Str)
+
+    op "index_set"(Str : ZString) -> Countable_Range<Univ_Integer>
+        // Return set of indices for string
+
+    op "slicing"(Str : ZString;
+      Index_Set : Countable_Range<Univ_Integer>) 
+      -> ZString
+        // a "read-only" slice
+
+    func Length(Str : ZString) -> Univ_Integer
+      is import(#string_length)
+
+    op "magnitude"(ZString) -> Univ_Integer is Length
+
+    func Hash(Val : ZString) -> Univ_Integer
+      is import(#hash_string)
+
+    op "|"(Left : ZString; Right : Right_Type is Imageable<>) 
+      -> ZString
+
+    op "|"(Left : Left_Type is Imageable<>; Right : ZString)
+      -> ZString
+
+    op "|="(var Left : ZString; Right : Right_Type is Imageable<>)
+
+    // Operations to convert to/from a ZVector of Univ_Character's
+    func To_ZVector(Str : ZString) -> ZVector<Univ_Character>
+    func From_ZVector(Vec : ZVector<Univ_Character>) -> ZString
+
+    func Replace(Orig : ZString;
+      Char : Univ_Character; With : Univ_Character) -> ZString
+    //  Replace each appearance of Char with "With"
+
+end interface PSL::Core::ZString
+    
+class PSL::Core::ZString is
+  // A universal string with characters indexed starting at 0
+    var U_Str : Univ_String
+
+  exports
+    op "indexing"(Str : ZString; Index : Univ_Integer<>) -> Univ_Character is
+        // a "read-only" element, indexed 0..<Length(Str)
+        return Str.U_Str[Index+1]
+    end op "indexing"
+
+    op "index_set"(Str : ZString) -> Countable_Range<Univ_Integer> is
+        // Return set of indices for string
+        return 0 ..< |Str.U_Str|
+    end op "index_set"
+
+    op "slicing"(Str : ZString;
+      Index_Set : Countable_Range<Univ_Integer>) 
+      -> ZString is
+        // a "read-only" slice
+        return (U_Str => Str.U_Str[Index_Set.First <.. Index_Set.Last+1])
+    end op "slicing"
+
+    op "*"(Left : Univ_Integer; Right : ZString) -> ZString is
+        // Produce specified number of "Right" strings in a row
+        return (U_Str => Left * Right.U_Str)
+    end op "*"
+
+    op "*"(Left : ZString; Right : Univ_Integer) -> ZString is
+        // Produce specified number of "Left" strings in a row
+        return Right * Left   // Just pass the buck to other "*"
+    end op "*"
+
+    op "|"(Left : ZString; Right : Right_Type is Imageable<>) 
+      -> ZString is
+        if Right is null then
+            return (U_Str => Left.U_Str | "null")
+        else
+            return (U_Str => Left.U_Str | Right_Type::To_String(Right))
+        end if
+    end op "|"
+
+    op "|"(Left : Left_Type is Imageable<>; Right : ZString)
+      -> ZString is
+        if Left is null then
+            return (U_Str => "null" | Right.U_Str)
+        else
+            return (U_Str => Left_Type::To_String(Left) | Right.U_Str)
+        end if
+    end op "|"
+
+    op "|="(var Left : ZString; Right : Right_Type is Imageable<>) is
+        if Right is null then
+            Left.U_Str |= "null"
+        else
+            Left.U_Str |= Right_Type::To_String(Right)
+        end if
+    end op "|="
+
+    // Operations to convert to/from a ZVector of Univ_Character's
+    func To_ZVector(Str : ZString) -> ZVector<Univ_Character> is
+        return [for I in 0 ..< Length(Str) => Str[I]]
+    end func To_ZVector
+
+    func From_ZVector(Vec : ZVector<Univ_Character>) -> ZString is
+        var Result : ZString := "";
+        for each C of Vec forward loop
+            Result |= C;
+        end loop;
+        return Result;
+    end func From_ZVector;
+
+    func Replace(Orig : ZString;
+      Char : Univ_Character; With : Univ_Character) -> Result : ZString is
+    //  Replace each appearance of Char with "With"
+
+       Result := ""
+
+       var Prev_Match := -1
+       for each [I => C] of Orig forward loop
+          //  Look for a match
+          if C == Char then
+             // Concatenate on unchanged part and replacement character
+             Result |= Orig[Prev_Match <..< I] | With
+             Prev_Match := I;
+          end if
+       end loop
+
+       if Prev_Match < 0 then
+          Result := Orig
+       elsif Prev_Match < |Orig|-1 then
+          Result |= Orig[Prev_Match <..< |Orig|]
+       end if
+    end func Replace
+
+end class PSL::Core::ZString
+
+func PSL::Test::Test_ZString() is
+    const U : ZString := "tab\t"
+    const T := U[3]
+    Println("U = " | U | ", Length(U) = " | Length(U) | ", U[4] = '" | T | "'")
+    const X : ZString := "this is a string"
+    const Y := X[2]
+    {Y == 'i'} // string indexing problem
+    const Z := X[5..6]
+    {Z == "is"} // string slicing problem, expected 'is', found Z 
+    Println("X = " | X | ", X[2] = " | Y | ", X[5..6] = " | Z)
+
+    Println("About to indent 4 and then print 'hello'")
+    Println(4 * " " | "hello")
+
+    const Seven_Xs :ZString := "x" * 7
+    {Seven_Xs == "xxxxxxx"} // Char multiplication check
+
+    Println("Here are seven x's: " | Seven_Xs)
+    
+    Print("Here are 6 y's: ")
+    Println('y' * 6)
+    Println("X.Replace('s', With => 'x') = " | X.Replace('s', With => 'x'))
+end func PSL::Test::Test_ZString
